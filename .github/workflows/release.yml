@@ -1,155 +1,133 @@
 name: Release
 
-permissions:
-  contents: write
-
+# Only a deliberately pushed tag can initiate a release; ordinary CI cannot.
 on:
   push:
     tags:
       - 'v*'
 
-jobs:
-  release:
-    runs-on: macos-14
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Select Xcode
-        run: sudo xcode-select -s /Applications/Xcode_16.1.app
-      
-      - name: Get version
-        id: version
-        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+permissions:
+  contents: read
 
-      - name: Update Info.plist version from tag
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Validate stable release tag
+        id: version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          VERSION_CLEAN="${{ steps.version.outputs.VERSION }}"
-          VERSION_CLEAN="${VERSION_CLEAN#v}"
-          BUILD="${VERSION_CLEAN//./}"
-          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${VERSION_CLEAN}" Resources/Info.plist
-          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${BUILD}" Resources/Info.plist
+          TAG_PATTERN='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          if [[ ! "$RELEASE_TAG" =~ $TAG_PATTERN ]]; then
+            echo 'Release tag must be vMAJOR.MINOR.PATCH (stable SemVer, no leading zeros).' >&2
+            exit 1
+          fi
+          printf 'version=%s\n' "${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve locked dependencies
+        run: swift package resolve --force-resolved-versions
 
       - name: Run tests
-        run: swift test
-      
-      - name: Build and Sign app bundle
+        run: swift test --force-resolved-versions
+
+      - name: Build explicitly unnotarized app
+        env:
+          APP_VERSION: ${{ steps.version.outputs.version }}
+          SIGNING_IDENTITY: '-'
+        run: ./build-app.sh
+
+      - name: Check dependency files stayed unchanged
+        run: git diff --exit-code -- Package.swift Package.resolved
+
+      - name: Package app and SHA256 checksums
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          chmod +x build-app.sh
-          ./build-app.sh
-      
-      - name: Create app archive
-        run: |
-          cd .build/release
-          tar -czf ntfy-macos-${{ steps.version.outputs.VERSION }}.tar.gz ntfy-macos.app
-      
-      - name: Create Release
-        uses: softprops/action-gh-release@v1
+          ARCH="$(uname -m)"
+          case "$ARCH" in arm64|x86_64) ;; *) echo 'Unsupported architecture' >&2; exit 1 ;; esac
+          ARCHIVE="ntfy-macos-$RELEASE_TAG-$ARCH-ad-hoc-unnotarized.tar.gz"
+          mkdir -p .build/release-assets
+          tar -czf ".build/release-assets/$ARCHIVE" -C .build/release ntfy-macos.app
+          {
+            printf 'Repository: %s\nTag: %s\nCommit: %s\nArchitecture: %s\n' "$GITHUB_REPOSITORY" "$RELEASE_TAG" "$(git rev-parse HEAD)" "$ARCH"
+            echo 'Signing: ad-hoc; NOT Developer ID signed; NOT notarized.'
+            echo 'Provenance: GitHub attestation identifies this workflow, not Apple trust.'
+            xcodebuild -version
+            swift --version
+          } > .build/release-assets/BUILD-INFO.txt
+          cd .build/release-assets
+          shasum -a 256 "$ARCHIVE" BUILD-INFO.txt > SHA256SUMS
+
+      - name: Pass release assets to publisher
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          files: .build/release/ntfy-macos-${{ steps.version.outputs.VERSION }}.tar.gz
-          generate_release_notes: true
+          name: release-assets
+          path: .build/release-assets/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Write/OIDC tokens are only available to publishing, never package builds/tests.
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Download this run's release assets
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-assets
+          path: dist
+
+      - name: Verify checksums
+        working-directory: dist
+        run: sha256sum --check SHA256SUMS
+
+      - name: Attest release artifacts
+        id: attest
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/BUILD-INFO.txt
+            dist/SHA256SUMS
+
+      - name: Publish clearly labeled release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      
-      - name: Update Homebrew tap
-        env:
-          TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
-          VERSION: ${{ steps.version.outputs.VERSION }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          ATTESTATION_BUNDLE: ${{ steps.attest.outputs.bundle-path }}
         run: |
-          if [ -z "$TAP_GITHUB_TOKEN" ]; then
-            echo "TAP_GITHUB_TOKEN not set, skipping Homebrew tap update"
-            exit 0
-          fi
-          
-          SOURCE_URL="https://github.com/${{ github.repository }}/archive/refs/tags/${VERSION}.tar.gz"
-          wget -q -O "source.tar.gz" "${SOURCE_URL}"
-          SHA256=$(shasum -a 256 "source.tar.gz" | awk '{print $1}')
-          
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git clone https://github.com/laurentftech/homebrew-ntfy-macos.git tap
-          cd tap
-          
-          cat > Formula/ntfy-macos.rb << 'FORMULA'
-          class NtfyMacos < Formula
-            desc "Native macOS CLI notifier and automation agent for ntfy"
-            homepage "https://github.com/laurentftech/ntfy-macos"
-            url "SOURCE_URL_PLACEHOLDER"
-            sha256 "SHA256_PLACEHOLDER"
-            license "MIT"
-            version "VERSION_PLACEHOLDER"
-            head "https://github.com/laurentftech/ntfy-macos.git", branch: "main"
-          
-            depends_on xcode: ["15.0", :build]
-            depends_on :macos
-          
-            def install
-              system "swift", "build", "-c", "release", "--disable-sandbox"
-              
-              app_name = "ntfy-macos"
-              app_bundle = "#{app_name}.app"
-              build_dir = ".build/release"
-              
-              mkdir_p "#{build_dir}/#{app_bundle}/Contents/MacOS"
-              mkdir_p "#{build_dir}/#{app_bundle}/Contents/Resources"
-              
-              cp "#{build_dir}/#{app_name}", "#{build_dir}/#{app_bundle}/Contents/MacOS/"
-              cp "Resources/Info.plist", "#{build_dir}/#{app_bundle}/Contents/"
-              cp "Resources/ntfy-macos.icns", "#{build_dir}/#{app_bundle}/Contents/Resources/"
-              
-              system "codesign", "--force", "--deep", "--sign", "-", "#{build_dir}/#{app_bundle}"
-              
-              prefix.install "#{build_dir}/#{app_bundle}"
-              bin.install_symlink prefix/"#{app_bundle}/Contents/MacOS/#{app_name}"
-            end
-          
-            service do
-              run [opt_prefix/"ntfy-macos.app/Contents/MacOS/ntfy-macos", "serve"]
-              keep_alive crashed: true
-              log_path var/"log/ntfy-macos/stdout.log"
-              error_log_path var/"log/ntfy-macos/stderr.log"
-            end
+          cp "$ATTESTATION_BUNDLE" dist/provenance.jsonl
+          cat > release-notes.md <<'NOTES'
+          This is an **ad-hoc signed, unnotarized** native-architecture build for local evaluation.
+          It is **not** Developer ID signed or Apple-notarized. Gatekeeper may reject downloaded apps.
+          Prefer a reviewed local source build; see `docs/BUILD_ON_MAC.md` for the macOS handoff.
 
-            def caveats
-              <<~EOS
-                To add ntfy-macos to Launchpad:
-                  sudo ln -sf #{opt_prefix}/ntfy-macos.app /Applications/
-              EOS
-            end
-
-            test do
-              system bin/"ntfy-macos", "help"
-            end
-          end
-          FORMULA
-          
-          sed -i '' "s|SOURCE_URL_PLACEHOLDER|${SOURCE_URL}|g" Formula/ntfy-macos.rb
-          sed -i '' "s|SHA256_PLACEHOLDER|${SHA256}|g" Formula/ntfy-macos.rb
-          sed -i '' "s|VERSION_PLACEHOLDER|${VERSION}|g" Formula/ntfy-macos.rb
-          
-          git add Formula/ntfy-macos.rb
-          git commit -m "Update ntfy-macos to ${VERSION}"
-          git push https://x-access-token:${TAP_GITHUB_TOKEN}@github.com/laurentftech/homebrew-ntfy-macos.git main
-
-      - name: Notify via ntfy
-        if: always()
-        env:
-          NTFY_TOPIC: ${{ secrets.NTFY_RELEASE_TOPIC }}
-          VERSION: ${{ steps.version.outputs.VERSION }}
-        run: |
-          if [ -z "$NTFY_TOPIC" ]; then
-            echo "NTFY_RELEASE_TOPIC not set, skipping notification"
-            exit 0
-          fi
-          if [ "${{ job.status }}" = "success" ]; then
-            curl -s -X POST "https://ntfy.sh/$NTFY_TOPIC" \
-              -H "Title: ntfy-macos ${VERSION} released" \
-              -H "Priority: 3" \
-              -H "Tags: tada,rocket" \
-              -d "Release ${VERSION} published successfully. Homebrew tap updated."
-          else
-            curl -s -X POST "https://ntfy.sh/$NTFY_TOPIC" \
-              -H "Title: ntfy-macos ${VERSION} release failed" \
-              -H "Priority: 4" \
-              -H "Tags: x,warning" \
-              -d "Release workflow failed for ${VERSION}. Check: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          fi
+          `SHA256SUMS` covers the archive and `BUILD-INFO.txt`. The GitHub provenance attestation
+          identifies the repository/workflow that produced these assets; it is not Apple notarization.
+          NOTES
+          gh release create "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "ntfy-macos $RELEASE_TAG (ad-hoc, unnotarized)" \
+            --notes-file release-notes.md \
+            --generate-notes \
+            dist/*.tar.gz dist/BUILD-INFO.txt dist/SHA256SUMS dist/provenance.jsonl

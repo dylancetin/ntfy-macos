@@ -10,21 +10,30 @@ SWIFT_BUILD_FLAGS ?=
 SWIFT_RUN_FLAGS ?=
 SWIFT_TEST_FLAGS ?=
 
-.PHONY: help build clean run test open-xcode open-vscode
+.PHONY: help resolve build app clean run test open-xcode open-vscode
 
 help:
 	@echo "Makefile targets:"
+	@echo "  make resolve       # fetch only the dependencies in Package.resolved"
 	@echo "  make build         # build via Swift Package Manager"
+	@echo "  make app           # build a local ad-hoc signed macOS app bundle"
 	@echo "  make run           # run the executable (swift run)"
 	@echo "  make test          # run the test suite (swift test)"
 	@echo "  make clean         # swift package clean"
 	@echo "  make open-xcode    # open Xcode workspace/project if present, else open package with xed"
 	@echo "  make open-vscode   # open repository in VS Code (uses 'code' if available)"
 
+# Locked resolution fails rather than silently changing dependencies.
+resolve:
+	@$(SWIFT) package resolve --force-resolved-versions
+
 # Build using SwiftPM
 build:
 	@echo "Building package..."
-	@$(SWIFT) build $(SWIFT_BUILD_FLAGS)
+	@$(SWIFT) build --force-resolved-versions $(SWIFT_BUILD_FLAGS)
+
+app:
+	@./build-app.sh
 
 # Clean build artifacts
 clean:
@@ -34,12 +43,12 @@ clean:
 # Run the executable via SwiftPM
 run:
 	@echo "Running $(PKG_NAME)..."
-	@$(SWIFT) run $(SWIFT_RUN_FLAGS) $(PKG_NAME)
+	@$(SWIFT) run --force-resolved-versions $(SWIFT_RUN_FLAGS) $(PKG_NAME)
 
 # Run tests via SwiftPM
 test:
 	@echo "Running tests..."
-	@$(SWIFT) test $(SWIFT_TEST_FLAGS)
+	@$(SWIFT) test --force-resolved-versions $(SWIFT_TEST_FLAGS)
 
 # Open Xcode workspace/project if present, otherwise open package with xed (if available)
 open-xcode:

@@ -13,7 +13,8 @@ let package = Package(
         )
     ],
     dependencies: [
-        .package(url: "https://github.com/jpsim/Yams.git", from: "5.0.0")
+        // Official Yams 5.4.0; keep the immutable revision and Package.resolved in sync.
+        .package(url: "https://github.com/jpsim/Yams.git", revision: "3d6871d5b4a5cd519adf233fbb576e0a2af71c17")
     ],
     targets: [
         .executableTarget(

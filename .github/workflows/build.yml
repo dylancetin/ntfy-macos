@@ -1,6 +1,7 @@
 name: Build & Test
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
   pull_request:
@@ -11,49 +12,57 @@ permissions:
 
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+    defaults:
+      run:
+        shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - name: Select Xcode
-        run: sudo xcode-select -s /Applications/Xcode_16.1.app
+      - name: Show build inputs
+        run: |
+          git rev-parse HEAD
+          xcodebuild -version
+          swift --version
+          uname -m
 
-      - name: Show Swift version
-        run: swift --version
-
-      - name: Build
-        run: swift build -c release
+      - name: Resolve locked dependencies
+        run: swift package resolve --force-resolved-versions
 
       - name: Run tests
-        run: swift test
+        run: swift test --force-resolved-versions
 
-      - name: Test Summary
+      - name: Build and verify local app bundle
+        env:
+          SIGNING_IDENTITY: '-'
+        run: ./build-app.sh
+
+      - name: Check dependency files stayed unchanged
+        run: git diff --exit-code -- Package.swift Package.resolved
+
+      - name: Archive local app bundle
         run: |
-          echo "### Test Results" >> $GITHUB_STEP_SUMMARY
-          echo "All 177 tests passed ✓" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Test Suite | Tests |" >> $GITHUB_STEP_SUMMARY
-          echo "|------------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| ConfigManagerTests | 7 |" >> $GITHUB_STEP_SUMMARY
-          echo "| ConfigTests | 21 |" >> $GITHUB_STEP_SUMMARY
-          echo "| ConfigValidatorTests | 12 |" >> $GITHUB_STEP_SUMMARY
-          echo "| ConfigWatcherTests | 7 |" >> $GITHUB_STEP_SUMMARY
-          echo "| EmojiTagsTests | 8 |" >> $GITHUB_STEP_SUMMARY
-          echo "| KeychainHelperTests | 5 |" >> $GITHUB_STEP_SUMMARY
-          echo "| LocalNotificationServerTests | 10 |" >> $GITHUB_STEP_SUMMARY
-          echo "| MarkdownStripperTests | 15 |" >> $GITHUB_STEP_SUMMARY
-          echo "| NotificationActionResolverTests | 5 |" >> $GITHUB_STEP_SUMMARY
-          echo "| NtfyClientTests | 8 |" >> $GITHUB_STEP_SUMMARY
-          echo "| NtfyErrorTests | 34 |" >> $GITHUB_STEP_SUMMARY
-          echo "| NtfyIntegrationTests | 15 |" >> $GITHUB_STEP_SUMMARY
-          echo "| NtfyMessageTests | 6 |" >> $GITHUB_STEP_SUMMARY
-          echo "| RetryAfterTests | 8 |" >> $GITHUB_STEP_SUMMARY
-          echo "| ScriptRunnerTests | 16 |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Note: For code coverage, open project in Xcode and run Product → Test with Code Coverage" >> $GITHUB_STEP_SUMMARY
+          mkdir -p .build/ci-artifacts
+          ARCH="$(uname -m)"
+          tar -czf ".build/ci-artifacts/ntfy-macos-$ARCH-ad-hoc-unnotarized.tar.gz" -C .build/release ntfy-macos.app
 
-      - name: Upload binary
-        uses: actions/upload-artifact@v4
+      - name: Upload local build
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: ntfy-macos
-          path: .build/release/ntfy-macos
+          name: ntfy-macos-local-ad-hoc-unnotarized
+          path: .build/ci-artifacts/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Test summary
+        run: |
+          {
+            echo '### Build and tests passed'
+            echo 'The complete Swift test suite passed; see the Run tests step for actual counts.'
+            echo 'The archived app is native-architecture, ad-hoc signed, and NOT notarized.'
+          } >> "$GITHUB_STEP_SUMMARY"
