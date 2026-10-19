@@ -31,8 +31,8 @@ final class HoldingURLProtocol: URLProtocol {
         let response = HTTPURLResponse(
             url: request.url!,
             statusCode: 200,
-            httpVersion: nil,
-            headerFields: nil
+            httpVersion: "HTTP/1.1",
+            headerFields: ["Content-Type": "application/x-ndjson"]
         )!
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
         // Intentionally no didLoad or didFinishLoading — connection stays "open"
@@ -163,7 +163,7 @@ final class NtfyClientTests: XCTestCase {
     }
 
     /// After disconnect(), the watchdog must not fire and trigger a reconnect.
-    @MainActor func testWatchdogDoesNotFireAfterDisconnect() {
+    @MainActor func testWatchdogDoesNotFireAfterDisconnect() async {
         HoldingURLProtocol.reset()
         let connectExp = expectation(description: "No reconnect after disconnect")
         connectExp.isInverted = true
@@ -176,15 +176,46 @@ final class NtfyClientTests: XCTestCase {
             watchdogInterval: 0.05, baseReconnectDelay: 0.0,
             urlSessionConfiguration: makeSessionConfig()
         )
+        defer {
+            client.disconnect()
+            withExtendedLifetime(delegate) {}
+        }
         client.delegate = delegate
         client.connect()
         client.disconnect()  // Immediately cancel — watchdog must not trigger
 
-        waitForExpectations(timeout: 0.3)
+        let result = await XCTWaiter.fulfillment(of: [connectExp], timeout: 0.3)
+        XCTAssertEqual(result, .completed, "\(client.connectionDiagnostics)")
     }
 
-/// Cancelled task errors must not trigger reconnect (avoids double-reconnect when watchdog fires).
-    @MainActor func testCancelledTaskDoesNotTriggerReconnect() {
+    /// A positive delivery test prevents the negative watchdog tests from passing through queue starvation.
+    @MainActor func testHTTP200DeliversConnectOnMainActor() async {
+        HoldingURLProtocol.reset()
+        let started = expectation(description: "Holding protocol started")
+        let connected = expectation(description: "HTTP 200 delivered didConnect")
+        HoldingURLProtocol.onRequest = { count in
+            if count == 1 { started.fulfill() }
+        }
+        let delegate = MockNtfyDelegate()
+        delegate.onConnect = { connected.fulfill() }
+        delegate.onError = { error in XCTFail("Local protocol failed (code \((error as NSError).code))") }
+        let client = NtfyClient(serverURL: "https://ntfy.sh", topics: ["test"], urlSessionConfiguration: makeSessionConfig())
+        defer {
+            client.disconnect()
+            HoldingURLProtocol.onRequest = nil
+            withExtendedLifetime(delegate) {}
+        }
+        client.delegate = delegate
+        client.connect()
+        let result = await XCTWaiter.fulfillment(of: [started, connected], timeout: 3)
+        XCTAssertEqual(result, .completed, "requests: \(HoldingURLProtocol.requestCount); \(client.connectionDiagnostics)")
+        XCTAssertEqual(HoldingURLProtocol.requestCount, 1)
+        XCTAssertEqual(client.connectionDiagnostics.responsesAccepted, 1)
+        XCTAssertEqual(client.connectionDiagnostics.callbacksWithoutDelegate, 0)
+    }
+
+    /// Cancelled task errors must not trigger reconnect (avoids double-reconnect when watchdog fires).
+    @MainActor func testCancelledTaskDoesNotTriggerReconnect() async {
         HoldingURLProtocol.reset()
 
         // Connect, then immediately disconnect — only 1 request should ever be made
@@ -199,8 +230,13 @@ final class NtfyClientTests: XCTestCase {
             watchdogInterval: 60.0, baseReconnectDelay: 0.0,
             urlSessionConfiguration: makeSessionConfig()
         )
+        defer {
+            client.disconnect()
+            HoldingURLProtocol.onRequest = nil
+        }
         client.connect()
-        waitForExpectations(timeout: 1.0)
+        let initialResult = await XCTWaiter.fulfillment(of: [initialExp], timeout: 3)
+        XCTAssertEqual(initialResult, .completed, "\(client.connectionDiagnostics)")
 
         // Disconnect and wait — request count must stay at 1
         client.disconnect()
@@ -209,7 +245,8 @@ final class NtfyClientTests: XCTestCase {
         HoldingURLProtocol.onRequest = { count in
             if count >= 2 { noExtraExp.fulfill() }
         }
-        waitForExpectations(timeout: 0.3)
+        let result = await XCTWaiter.fulfillment(of: [noExtraExp], timeout: 0.3)
+        XCTAssertEqual(result, .completed, "\(client.connectionDiagnostics)")
 
         XCTAssertEqual(HoldingURLProtocol.requestCount, 1)
     }

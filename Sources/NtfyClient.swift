@@ -110,6 +110,23 @@ struct BoundedNDJSONBuffer {
 }
 
 final class NtfyClient: NSObject, @unchecked Sendable {
+    /// Payload-free transport diagnostics, useful when a callback fails before logging is available.
+    struct ConnectionDiagnostics: Sendable {
+        var tasksStarted = 0
+        var responsesReceived = 0
+        var responsesAccepted = 0
+        var dataCallbacksReceived = 0
+        var dataCallbacksAccepted = 0
+        var taskCallbacksRejected = 0
+        var callbacksQueued = 0
+        var callbacksDelivered = 0
+        var callbacksDiscardedAsStale = 0
+        var callbacksWithoutDelegate = 0
+        var callbacksOverLimit = 0
+        var activeTaskIdentifier: Int?
+        var lastResponseTaskIdentifier: Int?
+    }
+
     /// Immutable subscription origin; never derived from publisher-controlled fields.
     let serverURL: String
     private let topics: [String]
@@ -140,6 +157,15 @@ final class NtfyClient: NSObject, @unchecked Sendable {
     private var generation: UInt64 = 0
     private var pendingCallbacks = 0
     private let maxPendingCallbacks = 128
+    private var diagnostics = ConnectionDiagnostics()
+
+    var connectionDiagnostics: ConnectionDiagnostics {
+        lock.lock()
+        defer { lock.unlock() }
+        var snapshot = diagnostics
+        snapshot.activeTaskIdentifier = dataTask?.taskIdentifier
+        return snapshot
+    }
 
     private var reconnectAttempts = 0
     private let maxReconnectAttempts = 10
@@ -213,16 +239,27 @@ final class NtfyClient: NSObject, @unchecked Sendable {
     // Thread-safe delegate call helper
     private func callDelegate(_ block: @escaping @MainActor @Sendable (NtfyClientDelegate) -> Void) {
         // Caller holds lock. Bound queued delivery too, not only partial wire records.
-        guard pendingCallbacks < maxPendingCallbacks else { return }
+        guard pendingCallbacks < maxPendingCallbacks else {
+            diagnostics.callbacksOverLimit &+= 1
+            return
+        }
         pendingCallbacks += 1
+        diagnostics.callbacksQueued &+= 1
         let expectedGeneration = generation
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.lock.lock()
             defer { self.lock.unlock() }
             self.pendingCallbacks -= 1
-            guard self.shouldReconnect, self.generation == expectedGeneration,
-                  let delegate = self.delegate else { return }
+            guard self.shouldReconnect, self.generation == expectedGeneration else {
+                self.diagnostics.callbacksDiscardedAsStale &+= 1
+                return
+            }
+            guard let delegate = self.delegate else {
+                self.diagnostics.callbacksWithoutDelegate &+= 1
+                return
+            }
+            self.diagnostics.callbacksDelivered &+= 1
             block(delegate)
         }
     }
@@ -285,6 +322,7 @@ final class NtfyClient: NSObject, @unchecked Sendable {
 
         buffer.reset()
         dataTask = session.dataTask(with: request)
+        diagnostics.tasksStarted &+= 1
         dataTask?.resume()
 
         Log.info("Connecting to ntfy subscription")
@@ -497,7 +535,12 @@ extension NtfyClient: URLSessionDataDelegate {
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
         lock.lock()
         defer { lock.unlock() }
-        guard shouldReconnect, dataTask === self.dataTask else { return }
+        diagnostics.dataCallbacksReceived &+= 1
+        guard shouldReconnect, dataTask === self.dataTask else {
+            diagnostics.taskCallbacksRejected &+= 1
+            return
+        }
+        diagnostics.dataCallbacksAccepted &+= 1
         lastDataReceived = Date()
         do {
             try buffer.append(data) { self.processLine($0) }
@@ -510,7 +553,10 @@ extension NtfyClient: URLSessionDataDelegate {
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
         lock.lock()
         defer { lock.unlock() }
-        guard shouldReconnect, task === dataTask else { return }
+        guard shouldReconnect, task === dataTask else {
+            diagnostics.taskCallbacksRejected &+= 1
+            return
+        }
         isConnecting = false
         stopWatchdog()
 
@@ -538,7 +584,10 @@ extension NtfyClient: URLSessionDataDelegate {
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse, completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
         lock.lock()
         defer { lock.unlock() }
+        diagnostics.responsesReceived &+= 1
+        diagnostics.lastResponseTaskIdentifier = dataTask.taskIdentifier
         guard shouldReconnect, dataTask === self.dataTask else {
+            diagnostics.taskCallbacksRejected &+= 1
             completionHandler(.cancel)
             return
         }
@@ -548,6 +597,7 @@ extension NtfyClient: URLSessionDataDelegate {
         }
 
         if httpResponse.statusCode == 200 {
+            diagnostics.responsesAccepted &+= 1
             isConnecting = false
             reconnectAttempts = 0
             startWatchdog()

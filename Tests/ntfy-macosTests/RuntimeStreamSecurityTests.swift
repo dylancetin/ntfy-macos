@@ -42,9 +42,10 @@ final class RuntimeStreamSecurityTests: XCTestCase {
         XCTAssertTrue(buffer.pending.isEmpty)
     }
 
-    @MainActor func testOffSubscriptionAndMalformedMessagesNeverReachDelegate() {
-        let replayKey = "lastMessageTime-https://stream-security.invalid/boundaries-subscribed"
-        let idKey = "lastMessageID-https://stream-security.invalid/boundaries-subscribed"
+    @MainActor func testOffSubscriptionAndMalformedMessagesNeverReachDelegate() async {
+        let probe = RuntimeStreamProbe(path: "boundaries-\(UUID().uuidString)")
+        let replayKey = "lastMessageTime-https://stream-security.invalid/\(probe.path)-subscribed"
+        let idKey = "lastMessageID-https://stream-security.invalid/\(probe.path)-subscribed"
         UserDefaults.standard.removeObject(forKey: replayKey)
         UserDefaults.standard.removeObject(forKey: idKey)
         defer {
@@ -52,9 +53,12 @@ final class RuntimeStreamSecurityTests: XCTestCase {
             UserDefaults.standard.removeObject(forKey: idKey)
         }
         let accepted = expectation(description: "Subscribed message delivered")
+        let connected = expectation(description: "Subscription accepted HTTP 200")
         let rejected = expectation(description: "Unsubscribed/malformed event not delivered")
         rejected.isInverted = true
         let delegate = MockNtfyDelegate()
+        delegate.onConnect = { connected.fulfill() }
+        delegate.onError = { error in XCTFail("Local mock transport failed (code \((error as NSError).code))") }
         delegate.onMessage = { message in
             if message.id == "valid" && message.topic == "subscribed" && message.message == "é" {
                 accepted.fulfill()
@@ -62,15 +66,24 @@ final class RuntimeStreamSecurityTests: XCTestCase {
                 rejected.fulfill()
             }
         }
-        let client = makeClient(path: "boundaries", fetchMissed: true)
-        defer { client.disconnect() }
+        let client = makeClient(probe: probe, fetchMissed: true)
+        defer {
+            client.disconnect()
+            RuntimeSecurityStreamProtocol.removeProbe(probe)
+            withExtendedLifetime(delegate) {}
+        }
         client.delegate = delegate
         client.connect()
-        waitForExpectations(timeout: 0.3)
+        guard await awaitCallbacks([probe.requestStarted, connected, accepted], client: client, probe: probe) else { return }
+        let rejectionResult = await XCTWaiter.fulfillment(of: [rejected], timeout: 0.3)
+        XCTAssertEqual(rejectionResult, .completed)
         XCTAssertEqual(UserDefaults.standard.integer(forKey: replayKey), 1)
+        XCTAssertEqual(UserDefaults.standard.string(forKey: idKey), "valid")
+        XCTAssertEqual(client.connectionDiagnostics.taskCallbacksRejected, 0)
     }
 
-    @MainActor func testSuccessfulConnectCannotCreateDuplicateStreamAndUnrelatedTasksAreIgnored() {
+    @MainActor func testSuccessfulConnectCannotCreateDuplicateStreamAndUnrelatedTasksAreIgnored() async {
+        let probe = RuntimeStreamProbe(path: "holding-\(UUID().uuidString)")
         let connected = expectation(description: "Initial stream connected")
         let unexpected = expectation(description: "No duplicate or stale callbacks")
         unexpected.isInverted = true
@@ -83,11 +96,17 @@ final class RuntimeStreamSecurityTests: XCTestCase {
         delegate.onMessage = { _ in unexpected.fulfill() }
         delegate.onDisconnect = { unexpected.fulfill() }
         delegate.onError = { _ in unexpected.fulfill() }
-        let client = makeClient(path: "holding")
-        defer { client.disconnect() }
+        let client = makeClient(probe: probe)
+        defer {
+            client.disconnect()
+            RuntimeSecurityStreamProtocol.removeProbe(probe)
+            withExtendedLifetime(delegate) {}
+        }
         client.delegate = delegate
         client.connect()
-        wait(for: [connected], timeout: 1)
+        guard await awaitCallbacks([probe.requestStarted, connected], client: client, probe: probe) else { return }
+        XCTAssertEqual(client.connectionDiagnostics.responsesAccepted, 1)
+        XCTAssertEqual(client.connectionDiagnostics.taskCallbacksRejected, 0)
 
         client.connect() // HTTP 200 cleared the old isConnecting flag; must still be idempotent.
         let foreignSession = URLSession(configuration: .ephemeral)
@@ -100,24 +119,37 @@ final class RuntimeStreamSecurityTests: XCTestCase {
         var disposition: URLSession.ResponseDisposition?
         client.urlSession(foreignSession, dataTask: foreignTask, didReceive: response) { disposition = $0 }
         XCTAssertEqual(disposition, .cancel)
-        wait(for: [unexpected], timeout: 0.3)
+        let result = await XCTWaiter.fulfillment(of: [unexpected], timeout: 0.3)
+        XCTAssertEqual(result, .completed, "\(probe.snapshot); \(client.connectionDiagnostics)")
         XCTAssertEqual(connectCount, 1)
+        XCTAssertEqual(probe.snapshot.requestCount, 1, "connect() must not start a second protocol request")
+        XCTAssertEqual(client.connectionDiagnostics.tasksStarted, 1)
+        XCTAssertEqual(client.connectionDiagnostics.taskCallbacksRejected, 3)
     }
 
-    @MainActor func testDisconnectRetiresQueuedMessagesAndReconnectTimers() {
+    @MainActor func testDisconnectRetiresQueuedMessagesAndReconnectTimers() async {
+        let probe = RuntimeStreamProbe(path: "boundaries-\(UUID().uuidString)")
         let unexpected = expectation(description: "Retired client never dispatches callbacks")
         unexpected.isInverted = true
         let delegate = MockNtfyDelegate()
         delegate.onMessage = { _ in unexpected.fulfill() }
         delegate.onConnect = { unexpected.fulfill() }
         delegate.onDisconnect = { unexpected.fulfill() }
-        let client = makeClient(path: "boundaries")
+        let client = makeClient(probe: probe)
+        defer {
+            client.disconnect()
+            RuntimeSecurityStreamProtocol.removeProbe(probe)
+            withExtendedLifetime(delegate) {}
+        }
         client.delegate = delegate
         client.connect()
         // The main queue cannot deliver any queued callbacks before this retirement.
         client.disconnect()
         client.connect()
-        waitForExpectations(timeout: 0.3)
+        // Suspending lets the main queue actually attempt delivery; a synchronous wait can hide bugs.
+        let result = await XCTWaiter.fulfillment(of: [unexpected], timeout: 0.3)
+        XCTAssertEqual(result, .completed, "\(probe.snapshot); \(client.connectionDiagnostics)")
+        XCTAssertEqual(client.connectionDiagnostics.tasksStarted, 1)
     }
 
     func testNonFiniteRetryAfterDoesNotCreateInvalidTimers() {
@@ -128,8 +160,9 @@ final class RuntimeStreamSecurityTests: XCTestCase {
         }
     }
 
-    @MainActor func testReplayUsesExclusiveIDAndDeduplicatesBeforeAutomationDelivery() {
-        let path = "cursor-\(UUID().uuidString)"
+    @MainActor func testReplayUsesExclusiveIDAndDeduplicatesBeforeAutomationDelivery() async {
+        let probe = RuntimeStreamProbe(path: "cursor-\(UUID().uuidString)")
+        let path = probe.path
         let prefix = "https://stream-security.invalid/\(path)-subscribed"
         defer {
             UserDefaults.standard.removeObject(forKey: "lastMessageTime-" + prefix)
@@ -138,43 +171,138 @@ final class RuntimeStreamSecurityTests: XCTestCase {
         let delivered = expectation(description: "New message arrives after reconnect with exclusive cursor")
         var ids: [String] = []
         let delegate = MockNtfyDelegate()
+        delegate.onError = { error in XCTFail("Local replay transport failed (code \((error as NSError).code))") }
         delegate.onMessage = { message in
             ids.append(message.id)
             if message.id == "second-id" { delivered.fulfill() }
         }
-        let client = makeClient(path: path, fetchMissed: true)
-        defer { client.disconnect() }
+        let client = makeClient(probe: probe, fetchMissed: true)
+        defer {
+            client.disconnect()
+            RuntimeSecurityStreamProtocol.removeProbe(probe)
+            withExtendedLifetime(delegate) {}
+        }
         client.delegate = delegate
         client.connect()
-        wait(for: [delivered], timeout: 3)
+        guard await awaitCallbacks([probe.requestStarted, delivered], client: client, probe: probe) else { return }
         XCTAssertEqual(ids, ["first-id", "second-id"])
         XCTAssertEqual(UserDefaults.standard.string(forKey: "lastMessageID-" + prefix), "second-id")
+        XCTAssertEqual(probe.snapshot.cursors, ["all", "first-id"])
     }
 
-    private func makeClient(path: String, fetchMissed: Bool = false) -> NtfyClient {
+    @MainActor private func awaitCallbacks(_ expectations: [XCTestExpectation], client: NtfyClient,
+                                           probe: RuntimeStreamProbe, file: StaticString = #filePath, line: UInt = #line) async -> Bool {
+        // Do not use synchronous XCTest waits on MainActor: NtfyClient delivers on the main queue.
+        // The static async waiter also avoids sending this non-Sendable XCTestCase off its actor.
+        let result = await XCTWaiter.fulfillment(of: expectations, timeout: 3)
+        XCTAssertEqual(result, .completed, "Protocol stages: \(probe.snapshot); client stages: \(client.connectionDiagnostics)", file: file, line: line)
+        return result == .completed
+    }
+
+    private func makeClient(probe: RuntimeStreamProbe, fetchMissed: Bool = false) -> NtfyClient {
+        RuntimeSecurityStreamProtocol.registerProbe(probe)
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [RuntimeSecurityStreamProtocol.self]
-        return NtfyClient(serverURL: "https://stream-security.invalid/\(path)", topics: ["subscribed"],
+        return NtfyClient(serverURL: "https://stream-security.invalid/\(probe.path)", topics: ["subscribed"],
                           fetchMissed: fetchMissed,
                           watchdogInterval: 60, baseReconnectDelay: 0,
                           urlSessionConfiguration: configuration)
     }
 }
 
+/// Per-test instrumentation, independent of the app's logger and main-queue delegate delivery.
+private final class RuntimeStreamProbe: @unchecked Sendable {
+    struct Snapshot: Sendable {
+        var requestCount = 0
+        var requestsWithoutProtocolClient = 0
+        var responsesSent = 0
+        var dataChunksSent = 0
+        var cursors: [String] = []
+    }
+
+    let path: String
+    let requestStarted = XCTestExpectation(description: "Local URLProtocol startLoading ran")
+    private let lock = NSLock()
+    private var state = Snapshot()
+
+    init(path: String) { self.path = path }
+
+    var snapshot: Snapshot {
+        lock.lock()
+        defer { lock.unlock() }
+        return state
+    }
+
+    func start(cursor: String?, hasClient: Bool) {
+        lock.lock()
+        state.requestCount += 1
+        let isFirst = state.requestCount == 1
+        if !hasClient { state.requestsWithoutProtocolClient += 1 }
+        if state.cursors.count < 8 { state.cursors.append(cursor ?? "none") }
+        lock.unlock()
+        if isFirst { requestStarted.fulfill() }
+    }
+
+    func sentResponse() {
+        lock.lock()
+        state.responsesSent += 1
+        lock.unlock()
+    }
+
+    func sentData() {
+        lock.lock()
+        state.dataChunksSent += 1
+        lock.unlock()
+    }
+}
+
 private final class RuntimeSecurityStreamProtocol: URLProtocol {
+    private static let probeLock = NSLock()
+    nonisolated(unsafe) private static var probes: [String: RuntimeStreamProbe] = [:]
+
+    static func registerProbe(_ probe: RuntimeStreamProbe) {
+        probeLock.lock()
+        defer { probeLock.unlock() }
+        probes["/\(probe.path)/subscribed/json"] = probe
+    }
+
+    static func removeProbe(_ probe: RuntimeStreamProbe) {
+        probeLock.lock()
+        defer { probeLock.unlock() }
+        probes.removeValue(forKey: "/\(probe.path)/subscribed/json")
+    }
+
+    private static func probe(for path: String) -> RuntimeStreamProbe? {
+        probeLock.lock()
+        defer { probeLock.unlock() }
+        return probes[path]
+    }
+
+    // Claim every request, including unexpected URLs, so these tests can never fall through to DNS/network.
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
     override func startLoading() {
-        let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+        guard let url = request.url, let probe = Self.probe(for: url.path) else {
+            client?.urlProtocol(self, didFailWithError: URLError(.unsupportedURL))
+            return
+        }
+        let cursor = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "since" }?.value
+        probe.start(cursor: cursor, hasClient: client != nil)
+        // Match ntfy's streaming response. A missing MIME type permits CFNetwork content sniffing,
+        // which may buffer a small/open mock stream instead of immediately delivering its response.
+        let response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: "HTTP/1.1",
+                                       headerFields: ["Content-Type": "application/x-ndjson"])!
+        probe.sentResponse()
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
         if request.url!.path.contains("cursor-") {
-            let cursor = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "since" }?.value
             if cursor == "all" {
                 let record = "{\"id\":\"first-id\",\"time\":1,\"event\":\"message\",\"topic\":\"subscribed\"}\n"
+                probe.sentData()
                 client?.urlProtocol(self, didLoad: Data((record + record).utf8))
                 client?.urlProtocolDidFinishLoading(self)
             } else if cursor == "first-id" {
+                probe.sentData()
                 client?.urlProtocol(self, didLoad: Data("{\"id\":\"second-id\",\"time\":1,\"event\":\"message\",\"topic\":\"subscribed\"}\n".utf8))
             }
             return
@@ -189,7 +317,9 @@ private final class RuntimeSecurityStreamProtocol: URLProtocol {
         """.utf8)
         // Split inside a multi-byte UTF-8 sequence.
         let split = payload.firstIndex(of: 0xC3)!.advanced(by: 1)
+        probe.sentData()
         client?.urlProtocol(self, didLoad: Data(payload[..<split]))
+        probe.sentData()
         client?.urlProtocol(self, didLoad: Data(payload[split...]))
         // Leave the stream open so EOF cannot mask delivery tests.
     }
