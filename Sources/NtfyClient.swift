@@ -151,6 +151,10 @@ final class NtfyClient: NSObject, @unchecked Sendable {
     private var retryAfterDelay: TimeInterval?  // From Retry-After header
     private var lastMessageTime: Int  // Track last message timestamp for fetch_missed
     private let lastMessageTimeKey: String  // UserDefaults key for persistence
+    private let lastMessageIDKey: String
+    private var lastMessageID: String?
+    private var recentMessageIDs: Set<String> = []
+    private var recentMessageOrder: [String] = []
 
     // Watchdog: reconnect if no data received for this long (ntfy sends keepalives every ~55s)
     private let watchdogInterval: TimeInterval
@@ -174,6 +178,8 @@ final class NtfyClient: NSObject, @unchecked Sendable {
         let topicsKey = topics.sorted().joined(separator: ",")
         self.lastMessageTimeKey = "lastMessageTime-\(serverURL)-\(topicsKey)"
         self.lastMessageTime = UserDefaults.standard.integer(forKey: lastMessageTimeKey)
+        self.lastMessageIDKey = "lastMessageID-\(serverURL)-\(topicsKey)"
+        self.lastMessageID = fetchMissed ? UserDefaults.standard.string(forKey: lastMessageIDKey) : nil
 
         // Create a dedicated serial queue for URLSession callbacks
         self.delegateQueue = OperationQueue()
@@ -181,6 +187,13 @@ final class NtfyClient: NSObject, @unchecked Sendable {
         self.delegateQueue.name = "com.ntfy-macos.urlsession"
 
         super.init()
+
+        if let id = lastMessageID, !id.isEmpty, id.utf8.count <= 256 {
+            recentMessageIDs.insert(id)
+            recentMessageOrder.append(id)
+        } else {
+            lastMessageID = nil
+        }
 
         let config = urlSessionConfiguration ?? URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = .infinity
@@ -242,8 +255,11 @@ final class NtfyClient: NSObject, @unchecked Sendable {
 
         // Add since parameter to fetch missed messages when enabled
         if fetchMissed {
-            if lastMessageTime > 0 {
-                // Reconnect: only fetch messages since the last one we received
+            if let lastMessageID {
+                // ntfy's ID cursor is exclusive; timestamp cursors replay the last second.
+                components.queryItems = [URLQueryItem(name: "since", value: lastMessageID)]
+            } else if lastMessageTime > 0 {
+                // Migrate an existing timestamp-only cursor without losing missed messages.
                 components.queryItems = [URLQueryItem(name: "since", value: String(lastMessageTime))]
             } else {
                 // First connect: fetch all cached messages
@@ -449,9 +465,19 @@ final class NtfyClient: NSObject, @unchecked Sendable {
 
         do {
             let message = try JSONDecoder().decode(NtfyMessage.self, from: data)
-            guard message.event == "message", isSubscribed(to: message.topic) else { return }
+            guard message.event == "message", isSubscribed(to: message.topic),
+                  !message.id.isEmpty, message.id.utf8.count <= 256 else { return }
 
             callDelegate { delegate in
+                guard self.recentMessageIDs.insert(message.id).inserted else { return }
+                self.recentMessageOrder.append(message.id)
+                if self.recentMessageOrder.count > 512 {
+                    self.recentMessageIDs.remove(self.recentMessageOrder.removeFirst())
+                }
+                if self.fetchMissed {
+                    self.lastMessageID = message.id
+                    UserDefaults.standard.set(message.id, forKey: self.lastMessageIDKey)
+                }
                 // Only delivered records may advance replay state; stale/overflowed callbacks cannot.
                 if message.time > self.lastMessageTime {
                     self.lastMessageTime = message.time

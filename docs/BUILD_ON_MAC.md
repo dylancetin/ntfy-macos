@@ -12,6 +12,8 @@ Use a macOS version supported by your installed **full Xcode 16 or newer**, with
 alone are not the documented toolchain. Open Xcode once and complete its normal
 license/component setup. Use an interactive logged-in desktop session for the
 notification test.
+Python 3 is also used for the five portable example-script security regressions
+(standard library only; no pip dependencies).
 
 Run these commands in Terminal (or hand them to a local coding agent):
 
@@ -65,6 +67,7 @@ set -euo pipefail
 mkdir -p .build/handoff-logs
 swift package resolve --force-resolved-versions 2>&1 | tee .build/handoff-logs/resolve.log
 swift test --force-resolved-versions 2>&1 | tee .build/handoff-logs/tests.log
+python3 Tests/audited_example_security_test.py 2>&1 | tee .build/handoff-logs/example-tests.log
 SIGNING_IDENTITY=- ./build-app.sh 2>&1 | tee .build/handoff-logs/build.log
 git diff --exit-code -- Package.swift Package.resolved
 ```

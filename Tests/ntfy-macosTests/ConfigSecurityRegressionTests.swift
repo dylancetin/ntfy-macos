@@ -153,6 +153,14 @@ final class ConfigSecurityRegressionTests: XCTestCase {
         XCTAssertNoThrow(try ConfigManager().loadConfig(from: path))
     }
 
+    func testAbsentExtendedACLsAreValidOnPrivateFilesAndDirectories() throws {
+        try ConfigManager.saveConfig(fixture, to: path)
+        try chmod(["-N", directory.path])
+        try chmod(["-N", path])
+        XCTAssertNoThrow(try ConfigManager().loadConfig(from: path))
+        XCTAssertNoThrow(try ConfigManager.saveConfig(fixture, to: path))
+    }
+
     func testACLWriteGrantOnParentRejected() throws {
         try ConfigManager.saveConfig(fixture, to: path)
         try chmod(["+a", "everyone allow add_file", directory.path])

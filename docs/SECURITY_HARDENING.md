@@ -16,6 +16,9 @@ original Homebrew tap and upstream release downloads do not include this fork's 
    trusted as its origin identity. Legacy notifications without origin metadata
    cannot dispatch privileged actions. Ambiguous topic-only configuration lookups
    return no result.
+   Stale stream callbacks are ignored. Reconnect uses ntfy's exclusive message-ID
+   cursor and a bounded recent-ID cache, preventing last-timestamp replay from
+   repeatedly invoking automation for the same message.
 2. **Action policy.** Publisher-supplied HTTP actions require an explicitly
    configured, nonempty `allowed_domains` list and permitted HTTP/HTTPS scheme.
    Requests use isolated networking and reject redirects. Browser-opening actions
@@ -36,7 +39,9 @@ original Homebrew tap and upstream release downloads do not include this fork's 
    script arguments, and script output. Logs and configuration use private storage.
    Config reads reject symlinks, nonregular files, wrong ownership, unsafe directory
    ancestry, group/other access, and files above 1 MiB. Writes use a mode-0600
-   temporary file and atomic replacement; sample creation will not overwrite an
+   temporary file inside a protected staging directory and atomic replacement.
+   Unsafe extended ACL grants are rejected, and inherited payload ACLs are removed
+   before secrets are written. Sample creation will not overwrite an
    existing file. YAML decoding errors do not echo secret configuration contents.
 7. **Authenticated local notifications.** The optional server stays loopback-only
    and notification-only. It now requires bearer authentication, exact loopback
@@ -69,7 +74,10 @@ chmod 600 "$HOME/.config/ntfy-macos/config.yml"
 For a custom `--config` path, apply private permissions to that file and its
 dedicated directory. Config paths must be owned by your account, without a
 group/world-writable ancestor (root-owned sticky system temp directories are an
-exception). Symlink config files are rejected; use a regular private copy instead.
+exception). Symlink config files and user-defined symlink parent directories are
+rejected; use a regular private path without `..` components instead. Standard
+root-owned macOS `/var`, `/tmp`, and `/etc` aliases are supported. The validated
+canonical path is retained for reload/save.
 New files are created privately automatically. Prefer Keychain for subscription
 tokens. Only edit permissions on directories you own and intend to use for this app.
 

@@ -37,6 +37,9 @@ jobs:
       - name: Run tests
         run: swift test --force-resolved-versions
 
+      - name: Test example input boundaries
+        run: python3 Tests/audited_example_security_test.py
+
       - name: Build and verify local app bundle
         env:
           SIGNING_IDENTITY: '-'

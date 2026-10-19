@@ -44,8 +44,13 @@ final class RuntimeStreamSecurityTests: XCTestCase {
 
     @MainActor func testOffSubscriptionAndMalformedMessagesNeverReachDelegate() {
         let replayKey = "lastMessageTime-https://stream-security.invalid/boundaries-subscribed"
+        let idKey = "lastMessageID-https://stream-security.invalid/boundaries-subscribed"
         UserDefaults.standard.removeObject(forKey: replayKey)
-        defer { UserDefaults.standard.removeObject(forKey: replayKey) }
+        UserDefaults.standard.removeObject(forKey: idKey)
+        defer {
+            UserDefaults.standard.removeObject(forKey: replayKey)
+            UserDefaults.standard.removeObject(forKey: idKey)
+        }
         let accepted = expectation(description: "Subscribed message delivered")
         let rejected = expectation(description: "Unsubscribed/malformed event not delivered")
         rejected.isInverted = true
@@ -123,6 +128,29 @@ final class RuntimeStreamSecurityTests: XCTestCase {
         }
     }
 
+    @MainActor func testReplayUsesExclusiveIDAndDeduplicatesBeforeAutomationDelivery() {
+        let path = "cursor-\(UUID().uuidString)"
+        let prefix = "https://stream-security.invalid/\(path)-subscribed"
+        defer {
+            UserDefaults.standard.removeObject(forKey: "lastMessageTime-" + prefix)
+            UserDefaults.standard.removeObject(forKey: "lastMessageID-" + prefix)
+        }
+        let delivered = expectation(description: "New message arrives after reconnect with exclusive cursor")
+        var ids: [String] = []
+        let delegate = MockNtfyDelegate()
+        delegate.onMessage = { message in
+            ids.append(message.id)
+            if message.id == "second-id" { delivered.fulfill() }
+        }
+        let client = makeClient(path: path, fetchMissed: true)
+        defer { client.disconnect() }
+        client.delegate = delegate
+        client.connect()
+        wait(for: [delivered], timeout: 3)
+        XCTAssertEqual(ids, ["first-id", "second-id"])
+        XCTAssertEqual(UserDefaults.standard.string(forKey: "lastMessageID-" + prefix), "second-id")
+    }
+
     private func makeClient(path: String, fetchMissed: Bool = false) -> NtfyClient {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [RuntimeSecurityStreamProtocol.self]
@@ -140,6 +168,17 @@ private final class RuntimeSecurityStreamProtocol: URLProtocol {
     override func startLoading() {
         let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        if request.url!.path.contains("cursor-") {
+            let cursor = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "since" }?.value
+            if cursor == "all" {
+                let record = "{\"id\":\"first-id\",\"time\":1,\"event\":\"message\",\"topic\":\"subscribed\"}\n"
+                client?.urlProtocol(self, didLoad: Data((record + record).utf8))
+                client?.urlProtocolDidFinishLoading(self)
+            } else if cursor == "first-id" {
+                client?.urlProtocol(self, didLoad: Data("{\"id\":\"second-id\",\"time\":1,\"event\":\"message\",\"topic\":\"subscribed\"}\n".utf8))
+            }
+            return
+        }
         guard request.url!.path.contains("boundaries") else { return }
         let payload = Data("""
         {"id":"foreign","time":999,"event":"message","topic":"privileged","message":"must not execute"}

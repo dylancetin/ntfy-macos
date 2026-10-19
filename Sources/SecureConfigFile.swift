@@ -54,20 +54,30 @@ enum SecureConfigFile {
 
         let data = Data(text.utf8)
         guard data.count <= maximumBytes else { throw unsafe("Configuration exceeds 1 MiB") }
-        let temporary = ".ntfy-config-\(UUID().uuidString)"
-        let fd = openat(parent.fd, temporary, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, mode_t(0o600))
+        // An inherited read ACL must never expose even an empty payload inode:
+        // another user could keep an open descriptor after the ACL is removed.
+        // First protect an empty staging directory, then create the payload inside it.
+        let stagingName = ".ntfy-config-\(UUID().uuidString)"
+        guard mkdirat(parent.fd, stagingName, mode_t(0o700)) == 0 else { throw posixError() }
+        defer { unlinkat(parent.fd, stagingName, AT_REMOVEDIR) }
+        let stagingFD = openat(parent.fd, stagingName, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        guard stagingFD >= 0 else { throw posixError() }
+        defer { close(stagingFD) }
+        try PrivateFileAccess.removeACL(on: stagingFD)
+        let temporary = "payload"
+        let fd = openat(stagingFD, temporary, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, mode_t(0o600))
         guard fd >= 0 else { throw posixError() }
-        defer { close(fd); unlinkat(parent.fd, temporary, 0) }
+        defer { close(fd); unlinkat(stagingFD, temporary, 0) }
         // A mode-0600 file can still inherit an ACL. Strip it before writing secrets.
         try PrivateFileAccess.removeACL(on: fd)
         let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: false)
         try handle.write(contentsOf: data)
         try handle.synchronize()
         if replacingExisting {
-            guard renameat(parent.fd, temporary, parent.fd, parent.name) == 0 else { throw posixError() }
+            guard renameat(stagingFD, temporary, parent.fd, parent.name) == 0 else { throw posixError() }
         } else {
-            guard linkat(parent.fd, temporary, parent.fd, parent.name, 0) == 0 else { throw posixError() }
-            guard unlinkat(parent.fd, temporary, 0) == 0 else { throw posixError() }
+            guard linkat(stagingFD, temporary, parent.fd, parent.name, 0) == 0 else { throw posixError() }
+            guard unlinkat(stagingFD, temporary, 0) == 0 else { throw posixError() }
         }
         guard fsync(parent.fd) == 0 else { throw posixError() }
     }
@@ -147,7 +157,10 @@ enum SecureConfigFile {
 /// POSIX modes alone do not constrain macOS extended ACLs. Deny-only ACLs are safe.
 enum PrivateFileAccess {
     static func rejectAllowACLs(on fd: Int32, directory: Bool = false) throws {
-        guard let acl = acl_get_fd(fd) else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+        guard let acl = acl_get_fd(fd) else {
+            if errno == ENOENT { return } // Darwin uses ENOENT for an absent extended ACL.
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
         defer { acl_free(UnsafeMutableRawPointer(acl)) }
         guard acl_valid(acl) == 0 else { throw ConfigError.insecureFilePermissions("Cannot validate file ACL") }
         var entry: acl_entry_t?

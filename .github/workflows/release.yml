@@ -41,6 +41,9 @@ jobs:
       - name: Run tests
         run: swift test --force-resolved-versions
 
+      - name: Test example input boundaries
+        run: python3 Tests/audited_example_security_test.py
+
       - name: Build explicitly unnotarized app
         env:
           APP_VERSION: ${{ steps.version.outputs.version }}

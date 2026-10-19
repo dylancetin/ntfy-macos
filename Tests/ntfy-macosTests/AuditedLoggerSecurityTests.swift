@@ -30,7 +30,8 @@ final class AuditedLoggerSecurityTests: XCTestCase {
             try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
         }
         PrivateRotatingLogger(directory: logs).write("Local diagnostic")
-        XCTAssertEqual(try permissions(directory), 0o700)
+        // Only the dedicated log directory is tightened; existing ancestors are validated.
+        XCTAssertEqual(try permissions(directory), 0o755)
         XCTAssertEqual(try permissions(logs), 0o700)
         XCTAssertEqual(try permissions(logfile), 0o600)
         XCTAssertEqual(try permissions(backup), 0o600)
