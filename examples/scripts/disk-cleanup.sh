@@ -2,10 +2,10 @@
 # Clean up disk space when storage is low
 # Triggered by: disk-alerts topic
 
-LOG_FILE="/tmp/disk-cleanup.log"
-MESSAGE="$1"
+# Command output is not persisted; avoid shared /tmp logs and notification text.
+LOG_FILE="/dev/null"
 
-echo "$(date): Disk cleanup triggered: $MESSAGE" >> "$LOG_FILE"
+echo "$(date): Disk cleanup triggered" >> "$LOG_FILE"
 
 # Clear Homebrew cache
 if command -v brew &> /dev/null; then

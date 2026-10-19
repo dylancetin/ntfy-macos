@@ -2,7 +2,8 @@
 # Upgrade all Homebrew packages
 # Triggered by: homebrew-updates topic
 
-LOG_FILE="/tmp/brew-upgrade.log"
+# Command output is not persisted; avoid shared /tmp logs and sensitive output.
+LOG_FILE="/dev/null"
 
 echo "$(date): Starting Homebrew upgrade..." >> "$LOG_FILE"
 

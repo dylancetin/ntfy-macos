@@ -22,7 +22,7 @@ final class ConfigManagerTests: XCTestCase {
     // MARK: - Loading config
 
     func testLoadConfigFileNotFound() {
-        let manager = ConfigManager.shared
+        let manager = ConfigManager()
         XCTAssertThrowsError(try manager.loadConfig(from: "/nonexistent/path/config.yml")) { error in
             if case ConfigError.fileNotFound = error {
                 // Expected
@@ -40,9 +40,9 @@ final class ConfigManagerTests: XCTestCase {
               - name: alerts
                 icon_symbol: bell.fill
         """
-        try yaml.write(toFile: tempConfigPath, atomically: true, encoding: .utf8)
+        try SecureConfigFile.write(yaml, to: tempConfigPath)
 
-        let manager = ConfigManager.shared
+        let manager = ConfigManager()
         try manager.loadConfig(from: tempConfigPath)
 
         XCTAssertNotNil(manager.config)
@@ -63,9 +63,9 @@ final class ConfigManagerTests: XCTestCase {
               - name: private
                 icon_symbol: lock
         """
-        try yaml.write(toFile: tempConfigPath, atomically: true, encoding: .utf8)
+        try SecureConfigFile.write(yaml, to: tempConfigPath)
 
-        let manager = ConfigManager.shared
+        let manager = ConfigManager()
         try manager.loadConfig(from: tempConfigPath)
 
         XCTAssertEqual(manager.config?.servers.count, 2)
@@ -80,9 +80,9 @@ final class ConfigManagerTests: XCTestCase {
             topics:
               - name: [invalid
         """
-        try invalidYaml.write(toFile: tempConfigPath, atomically: true, encoding: .utf8)
+        try SecureConfigFile.write(invalidYaml, to: tempConfigPath)
 
-        let manager = ConfigManager.shared
+        let manager = ConfigManager()
         XCTAssertThrowsError(try manager.loadConfig(from: tempConfigPath))
     }
 
@@ -99,9 +99,9 @@ final class ConfigManagerTests: XCTestCase {
               - name: news
                 icon_symbol: newspaper
         """
-        try yaml.write(toFile: tempConfigPath, atomically: true, encoding: .utf8)
+        try SecureConfigFile.write(yaml, to: tempConfigPath)
 
-        let manager = ConfigManager.shared
+        let manager = ConfigManager()
         try manager.loadConfig(from: tempConfigPath)
 
         let alertsTopic = manager.topicConfig(for: "alerts")

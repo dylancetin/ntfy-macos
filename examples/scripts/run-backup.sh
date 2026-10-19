@@ -2,10 +2,10 @@
 # Run Time Machine backup or custom backup script
 # Triggered by: backup-trigger topic (silent)
 
-LOG_FILE="/tmp/backup.log"
-MESSAGE="$1"
+# Command output is not persisted; avoid shared /tmp logs and notification text.
+LOG_FILE="/dev/null"
 
-echo "$(date): Backup triggered with message: $MESSAGE" >> "$LOG_FILE"
+echo "$(date): Backup triggered" >> "$LOG_FILE"
 
 # Option 1: Trigger Time Machine
 # tmutil startbackup >> "$LOG_FILE" 2>&1

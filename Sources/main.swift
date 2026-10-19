@@ -17,13 +17,14 @@ enum AppConstants {
     }
 }
 
-final class NtfyMacOS: NtfyClientDelegate, @unchecked Sendable {
+@MainActor final class NtfyMacOS: NtfyClientDelegate {
     private var clients: [NtfyClient] = []
     private var clientToServer: [ObjectIdentifier: String] = [:]  // Maps client to server URL
     private var notificationManager: NotificationManager?
     private let scriptRunner = ScriptRunner()
     private var configWatcher: ConfigWatcher?
     private var localServer: LocalNotificationServer?
+    private var serviceGeneration: UInt64 = 0
 
     init() {
         // Don't initialize notificationManager here - wait until it's needed
@@ -50,11 +51,11 @@ final class NtfyMacOS: NtfyClientDelegate, @unchecked Sendable {
                 print("Sample configuration created. Please edit it and restart the service.")
                 exit(1)
             } catch {
-                print("Failed to create sample configuration: \(error)")
+                print("Failed to create sample configuration")
                 exit(1)
             }
         } catch {
-            print("Failed to load configuration: \(error)")
+            print("Failed to load configuration; check its syntax, values, and permissions")
             exit(1)
         }
 
@@ -71,15 +72,11 @@ final class NtfyMacOS: NtfyClientDelegate, @unchecked Sendable {
 
         Log.info("ntfy-macos v\(AppConstants.effectiveVersion) starting...")
         Log.info("Configured servers: \(config.servers.count)")
-        for server in config.servers {
-            let topics = server.topics.map { $0.name }.joined(separator: ", ")
-            Log.info("  - \(server.url): \(topics)")
-        }
 
         // Start watching config file for changes
-        configWatcher = ConfigWatcher(configPath: configPath)
+        configWatcher = ConfigWatcher(configPath: ConfigManager.shared.activeConfigPath)
         configWatcher?.startWatching { [weak self] in
-            self?.reloadConfig()
+            Task { @MainActor in self?.reloadConfig() }
         }
     }
 
@@ -91,36 +88,39 @@ final class NtfyMacOS: NtfyClientDelegate, @unchecked Sendable {
         }
 
         let notificationManager = ensureNotificationManager()
+        let expectedGeneration = serviceGeneration
 
         // Check authorization status before starting the service
         notificationManager.getAuthorizationStatus { [weak self] status in
-            guard let self = self else { return }
+            Task { @MainActor in
+                guard let self, self.serviceGeneration == expectedGeneration else { return }
 
-            let statusName: String
-            switch status {
-            case .notDetermined: statusName = "not determined"
-            case .denied: statusName = "denied"
-            case .authorized: statusName = "authorized"
-            case .provisional: statusName = "provisional"
-            case .ephemeral: statusName = "ephemeral"
-            @unknown default: statusName = "unknown"
-            }
-            Log.info("Authorization status: \(statusName)")
+                let statusName: String
+                switch status {
+                case .notDetermined: statusName = "not determined"
+                case .denied: statusName = "denied"
+                case .authorized: statusName = "authorized"
+                case .provisional: statusName = "provisional"
+                case .ephemeral: statusName = "ephemeral"
+                @unknown default: statusName = "unknown"
+                }
+                Log.info("Authorization status: \(statusName)")
 
-            if status == .authorized {
-                self.connectClients()
-            } else {
-                // Request permission automatically on first launch
-                Log.info("Requesting notification permission...")
-                Task { @MainActor in
+                if status == .authorized {
+                    self.connectClients()
+                } else {
+                    Log.info("Requesting notification permission...")
                     PermissionHelper.requestPermissionsWithWindow { granted in
-                        if granted {
-                            Log.success("Permission granted!")
-                            self.connectClients()
-                        } else {
-                            Log.error("Notification permission not granted")
-                            Log.info("   Please enable notifications in System Settings → Notifications → ntfy-macos")
-                            exit(1)
+                        Task { @MainActor in
+                            guard self.serviceGeneration == expectedGeneration else { return }
+                            if granted {
+                                Log.success("Permission granted!")
+                                self.connectClients()
+                            } else {
+                                Log.error("Notification permission not granted")
+                                Log.info("   Please enable notifications in System Settings → Notifications → ntfy-macos")
+                                exit(1)
+                            }
                         }
                     }
                 }
@@ -129,16 +129,16 @@ final class NtfyMacOS: NtfyClientDelegate, @unchecked Sendable {
     }
 
     private func connectClients() {
-        guard let config = ConfigManager.shared.config else { return }
+        guard clients.isEmpty, let config = ConfigManager.shared.config else { return }
 
         // Start local notification server if configured
-        if let port = config.localServerPort {
+        if let port = config.localServerPort, let token = config.localServerToken, token.count >= 32 {
             localServer?.stop()
-            localServer = LocalNotificationServer(port: port)
+            localServer = LocalNotificationServer(port: port, authToken: token)
             do {
                 try localServer?.start()
             } catch {
-                Log.error("Failed to start local notification server on port \(port): \(error)")
+                Log.error("Failed to start local notification server")
             }
         } else {
             localServer?.stop()
@@ -149,9 +149,7 @@ final class NtfyMacOS: NtfyClientDelegate, @unchecked Sendable {
         let serverInfos = config.servers.map { server in
             (url: server.url, topics: server.topics.map { $0.name })
         }
-        Task { @MainActor in
-            StatusBarController.shared.initializeServers(servers: serverInfos)
-        }
+        StatusBarController.shared.initializeServers(servers: serverInfos)
 
         // Create clients for each server, grouping topics by fetch_missed setting
         for serverConfig in config.servers {
@@ -170,7 +168,7 @@ final class NtfyMacOS: NtfyClientDelegate, @unchecked Sendable {
 
             // Create client for topics that need fetch_missed
             if !topicsWithFetchMissed.isEmpty {
-                Log.info("Creating client for \(serverConfig.url) (fetch_missed: true, topics: \(topicsWithFetchMissed.joined(separator: ", ")))...")
+                Log.info("Creating subscription (fetch_missed: true, topics: \(topicsWithFetchMissed.count))")
                 let client = NtfyClient(
                     serverURL: serverConfig.url,
                     topics: topicsWithFetchMissed,
@@ -185,7 +183,7 @@ final class NtfyMacOS: NtfyClientDelegate, @unchecked Sendable {
 
             // Create client for topics that don't need fetch_missed
             if !topicsWithoutFetchMissed.isEmpty {
-                Log.info("Creating client for \(serverConfig.url) (fetch_missed: false, topics: \(topicsWithoutFetchMissed.joined(separator: ", ")))...")
+                Log.info("Creating subscription (fetch_missed: false, topics: \(topicsWithoutFetchMissed.count))")
                 let client = NtfyClient(
                     serverURL: serverConfig.url,
                     topics: topicsWithoutFetchMissed,
@@ -203,31 +201,20 @@ final class NtfyMacOS: NtfyClientDelegate, @unchecked Sendable {
     func reloadConfig() {
         Log.info("Reloading configuration...")
 
-        // Stop local server
-        localServer?.stop()
-        localServer = nil
-
-        // Disconnect all clients
-        for client in clients {
-            client.disconnect()
-        }
-        clients.removeAll()
-        clientToServer.removeAll()
-
-        // Reload config file
+        // Load transactionally from the active path before retiring working clients.
         do {
-            try ConfigManager.shared.loadConfig(from: nil)
+            try ConfigManager.shared.loadConfig(from: ConfigManager.shared.activeConfigPath)
             DispatchQueue.main.async {
                 // Check for config warnings (unknown keys, etc.)
                 if let warning = ConfigManager.shared.configWarning {
-                    Log.info("Configuration warning: \(warning)")
+                    Log.info("Configuration contains warnings")
                     StatusBarController.shared.showConfigWarning(warning)
                 } else {
                     StatusBarController.shared.clearConfigError()
                 }
             }
         } catch {
-            Log.error("Failed to reload configuration: \(error)")
+            Log.error("Failed to reload configuration")
             let errorMessage = (error as? LocalizedError)?.errorDescription ?? "\(error)"
             DispatchQueue.main.async {
                 StatusBarController.shared.showConfigError(errorMessage)
@@ -235,30 +222,41 @@ final class NtfyMacOS: NtfyClientDelegate, @unchecked Sendable {
             return
         }
 
+        serviceGeneration &+= 1
+        localServer?.stop()
+        localServer = nil
+        let retiredClients = clients
+        clients.removeAll()
+        clientToServer.removeAll()
+        for client in retiredClients {
+            client.delegate = nil
+            client.disconnect()
+        }
+        notificationManager?.clearCategories()
+
         guard let config = ConfigManager.shared.config else {
             Log.error("Configuration is invalid")
             return
         }
 
         Log.info("Reloaded servers: \(config.servers.count)")
-        for server in config.servers {
-            let topics = server.topics.map { $0.name }.joined(separator: ", ")
-            Log.info("  - \(server.url): \(topics)")
-        }
 
         // Reconnect with new config
         startService()
     }
 
     func ntfyClient(_ client: NtfyClient, didReceiveMessage message: NtfyMessage) {
-        Log.info("📩 Received message on topic '\(message.topic)': \(message.message ?? "")")
-
-        let topicConfig = ConfigManager.shared.topicConfig(for: message.topic)
+        guard let origin = activeOrigin(for: client),
+              message.event == "message", client.isSubscribed(to: message.topic),
+              let topicConfig = ConfigManager.shared.topicConfig(for: message.topic, serverURL: origin) else {
+            return
+        }
+        Log.info("Received subscribed notification")
 
         // Handle auto-run scripts
-        if let autoRunScript = topicConfig?.autoRunScript {
+        if let autoRunScript = topicConfig.autoRunScript {
             if scriptRunner.validateScript(at: autoRunScript) {
-                Log.info("Auto-running script: \(autoRunScript)")
+                Log.info("Running configured automation")
                 // Pass message context as environment variables
                 var env: [String: String] = [
                     "NTFY_ID": message.id,
@@ -276,33 +274,31 @@ final class NtfyMacOS: NtfyClientDelegate, @unchecked Sendable {
         }
 
         // Show notification (respects silent flag)
-        ensureNotificationManager().showNotification(for: message, topicConfig: topicConfig)
+        ensureNotificationManager().showNotification(for: message, topicConfig: topicConfig, originatingServerURL: origin)
+    }
+
+    private func activeOrigin(for client: NtfyClient) -> String? {
+        guard clients.contains(where: { $0 === client }),
+              let origin = clientToServer[ObjectIdentifier(client)],
+              origin == client.serverURL else { return nil }
+        return origin
     }
 
     func ntfyClient(_ client: NtfyClient, didEncounterError error: Error) {
-        Log.error("Error: \(error.localizedDescription)")
+        guard activeOrigin(for: client) != nil else { return }
+        Log.error("Subscription error (code \((error as NSError).code))")
     }
 
     func ntfyClientDidConnect(_ client: NtfyClient) {
-        if let serverUrl = clientToServer[ObjectIdentifier(client)] {
-            Log.success("Connected to \(serverUrl)")
-            Task { @MainActor in
-                StatusBarController.shared.setServerConnected(serverUrl, connected: true)
-            }
-        } else {
-            Log.success("Connected to ntfy server")
-        }
+        guard let serverUrl = activeOrigin(for: client) else { return }
+        Log.success("Connected to subscription server")
+        StatusBarController.shared.setServerConnected(serverUrl, connected: true)
     }
 
     func ntfyClientDidDisconnect(_ client: NtfyClient) {
-        if let serverUrl = clientToServer[ObjectIdentifier(client)] {
-            Log.info("Disconnected from \(serverUrl)")
-            Task { @MainActor in
-                StatusBarController.shared.setServerConnected(serverUrl, connected: false)
-            }
-        } else {
-            Log.info("Disconnected from ntfy server")
-        }
+        guard let serverUrl = activeOrigin(for: client) else { return }
+        Log.info("Disconnected from subscription server")
+        StatusBarController.shared.setServerConnected(serverUrl, connected: false)
     }
 }
 
@@ -330,7 +326,7 @@ struct CLI {
             // Schedule the actual service start for after RunLoop begins
             // Use Timer to ensure RunLoop is actively running
             Timer.scheduledTimer(withTimeInterval: 0.1, repeats: false) { [ntfyAppInstance] _ in
-                ntfyAppInstance?.startService()
+                Task { @MainActor in ntfyAppInstance?.startService() }
             }
 
             return true // Needs RunLoop
@@ -353,7 +349,7 @@ struct CLI {
             // Schedule the actual service start for after RunLoop begins
             // Use Timer to ensure RunLoop is actively running
             Timer.scheduledTimer(withTimeInterval: 0.1, repeats: false) { [ntfyAppInstance] _ in
-                ntfyAppInstance?.startService()
+                Task { @MainActor in ntfyAppInstance?.startService() }
             }
 
             return true // Needs RunLoop
@@ -375,7 +371,7 @@ struct CLI {
             exit(0)
 
         default:
-            print("Unknown command: \(command)")
+            print("Unknown command")
             printUsage()
             exit(1)
         }
@@ -402,9 +398,9 @@ struct CLI {
 
             do {
                 try KeychainHelper.saveToken(token, forServer: server)
-                print("✅ Token saved for server: \(server)")
+                print("✅ Token saved")
             } catch {
-                print("❌ Failed to save token: \(error)")
+                print("❌ Failed to save token")
                 exit(1)
             }
 
@@ -421,7 +417,7 @@ struct CLI {
                     }
                 }
             } catch {
-                print("❌ Failed to list servers: \(error)")
+                print("❌ Failed to list servers")
                 exit(1)
             }
 
@@ -435,14 +431,14 @@ struct CLI {
 
             do {
                 try KeychainHelper.deleteToken(forServer: server)
-                print("✅ Token removed for server: \(server)")
+                print("✅ Token removed")
             } catch {
-                print("❌ Failed to remove token: \(error)")
+                print("❌ Failed to remove token")
                 exit(1)
             }
 
         default:
-            print("Unknown auth subcommand: \(subcommand)")
+            print("Unknown auth subcommand")
             printAuthUsage()
             exit(1)
         }
@@ -478,7 +474,7 @@ struct CLI {
                 if granted {
                     let notificationManager = NotificationManager.shared
                     notificationManager.showTestNotification(topic: topic)
-                    print("✅ Test notification sent for topic: \(topic)")
+                    print("✅ Test notification sent")
                     // Give time for notification to be delivered, then exit cleanly
                     DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
                         NSApp.terminate(nil)
@@ -504,7 +500,7 @@ struct CLI {
             print("Sample configuration created at: \(configPath)")
             print("Please edit the configuration file and run 'ntfy-macos serve' to start the service.")
         } catch {
-            print("Failed to create configuration: \(error)")
+            print("Failed to create configuration")
             exit(1)
         }
     }
@@ -618,7 +614,7 @@ DispatchQueue.main.async {
 
         // Show any initial config warnings
         if let warning = ConfigManager.shared.configWarning {
-            Log.info("Configuration warning: \(warning)")
+            Log.info("Configuration contains warnings")
             StatusBarController.shared.showConfigWarning(warning)
         }
     }

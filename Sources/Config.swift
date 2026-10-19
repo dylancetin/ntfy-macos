@@ -157,15 +157,18 @@ struct ServerConfig: Codable {
 struct AppConfig: Codable {
     let servers: [ServerConfig]
     let localServerPort: UInt16?
+    let localServerToken: String?
 
-    init(servers: [ServerConfig], localServerPort: UInt16? = nil) {
+    init(servers: [ServerConfig], localServerPort: UInt16? = nil, localServerToken: String? = nil) {
         self.servers = servers
         self.localServerPort = localServerPort
+        self.localServerToken = localServerToken
     }
 
     enum CodingKeys: String, CodingKey {
         case servers
         case localServerPort = "local_server_port"
+        case localServerToken = "local_server_token"
     }
 
     // Convenience: all topics across all servers
@@ -175,9 +178,15 @@ struct AppConfig: Codable {
 
     /// Finds the server config that contains a given topic
     func serverConfig(forTopic topicName: String) -> ServerConfig? {
-        return servers.first { server in
+        let matches = servers.filter { server in
             server.topics.contains { $0.name == topicName }
         }
+        return matches.count == 1 ? matches.first : nil
+    }
+
+    /// Network-origin identity must be supplied for all security-sensitive lookups.
+    func serverConfig(forURL serverURL: String, topic topicName: String) -> ServerConfig? {
+        servers.first { $0.url == serverURL && $0.topics.contains { $0.name == topicName } }
     }
 }
 
@@ -209,6 +218,18 @@ struct ConfigValidator {
     
     /// Validates the entire config
     static func validate(_ config: AppConfig) throws {
+        if let port = config.localServerPort {
+            guard port >= 1024, let token = config.localServerToken,
+                  isValidLocalServerToken(token) else {
+                throw ConfigError.insecureFilePermissions(
+                    "Local server requires a port between 1024 and 65535 and a local_server_token of at least 32 ASCII letters, digits, '-' or '_'."
+                )
+            }
+        }
+        guard Set(config.servers.map { $0.url }).count == config.servers.count else {
+            throw ConfigError.decodingError(NSError(domain: "ConfigValidator", code: 6,
+                userInfo: [NSLocalizedDescriptionKey: "Duplicate server URLs are not allowed"]))
+        }
         // Validate servers
         for server in config.servers {
             try validateServerURL(server.url)
@@ -224,6 +245,14 @@ struct ConfigValidator {
             
             // Validate unique topic names per server
             let topicNames = server.topics.map { $0.name }
+            guard topicNames.allSatisfy({ name in
+                !name.isEmpty && name.utf8.count <= 256 && name.unicodeScalars.allSatisfy {
+                    CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-").contains($0)
+                }
+            }) else {
+                throw ConfigError.decodingError(NSError(domain: "ConfigValidator", code: 7,
+                    userInfo: [NSLocalizedDescriptionKey: "Topic names must use only ASCII letters, digits, '_' or '-' (1–256 bytes)"]))
+            }
             if topicNames.count != Set(topicNames).count {
                 throw ConfigError.decodingError(NSError(
                     domain: "ConfigValidator",
@@ -233,6 +262,12 @@ struct ConfigValidator {
             }
         }
     }
+
+    static func isValidLocalServerToken(_ token: String) -> Bool {
+        (32...256).contains(token.utf8.count) && token.utf8.allSatisfy {
+            (65...90).contains($0) || (97...122).contains($0) || (48...57).contains($0) || $0 == 45 || $0 == 95
+        }
+    }
     
     /// Validates a server URL
     static func validateServerURL(_ urlString: String) throws {
@@ -240,7 +275,7 @@ struct ConfigValidator {
             throw ConfigError.decodingError(NSError(
                 domain: "ConfigValidator",
                 code: 3,
-                userInfo: [NSLocalizedDescriptionKey: "Invalid URL format: \(urlString)"]
+                userInfo: [NSLocalizedDescriptionKey: "Invalid server URL format"]
             ))
         }
         
@@ -249,7 +284,7 @@ struct ConfigValidator {
             throw ConfigError.decodingError(NSError(
                 domain: "ConfigValidator",
                 code: 4,
-                userInfo: [NSLocalizedDescriptionKey: "URL must use http or https scheme: \(urlString)"]
+                userInfo: [NSLocalizedDescriptionKey: "Server URL must use http or https"]
             ))
         }
         
@@ -257,8 +292,12 @@ struct ConfigValidator {
             throw ConfigError.decodingError(NSError(
                 domain: "ConfigValidator",
                 code: 5,
-                userInfo: [NSLocalizedDescriptionKey: "URL must have a valid host: \(urlString)"]
+                userInfo: [NSLocalizedDescriptionKey: "Server URL must have a valid host"]
             ))
+        }
+        guard url.user == nil, url.password == nil, url.query == nil, url.fragment == nil else {
+            throw ConfigError.decodingError(NSError(domain: "ConfigValidator", code: 8,
+                userInfo: [NSLocalizedDescriptionKey: "Server URL cannot contain credentials, a query, or a fragment; use the token setting or Keychain"]))
         }
     }
 }
@@ -267,6 +306,13 @@ final class ConfigManager: @unchecked Sendable {
     static let shared = ConfigManager()
     private let lock = NSLock()
     private var _config: AppConfig?
+    private var _activeConfigPath: String?
+
+    var activeConfigPath: String {
+        lock.lock()
+        defer { lock.unlock() }
+        return _activeConfigPath ?? Self.defaultConfigPath
+    }
 
     var config: AppConfig? {
         lock.lock()
@@ -274,7 +320,7 @@ final class ConfigManager: @unchecked Sendable {
         return _config
     }
 
-    private init() {}
+    init() {}
 
     /// Default configuration path: ~/.config/ntfy-macos/config.yml
     static var defaultConfigPath: String {
@@ -284,22 +330,8 @@ final class ConfigManager: @unchecked Sendable {
 
     /// Loads configuration from the specified path or default location
     func loadConfig(from path: String? = nil) throws {
-        let configPath = path ?? ConfigManager.defaultConfigPath
-        let url = URL(fileURLWithPath: configPath)
-
-        guard FileManager.default.fileExists(atPath: configPath) else {
-            throw ConfigError.fileNotFound
-        }
-
-        // Validate file permissions - should not be world-writable
-        try validateFilePermissions(at: configPath)
-
-        let yamlString: String
-        do {
-            yamlString = try String(contentsOf: url, encoding: .utf8)
-        } catch {
-            throw ConfigError.fileNotFound
-        }
+        let configPath = try SecureConfigFile.canonicalPath(for: path ?? Self.defaultConfigPath)
+        let yamlString = try SecureConfigFile.read(from: configPath)
 
         // Validate for unknown keys before decoding (warnings only, doesn't block loading)
         let unknownKeysWarning = checkForUnknownKeys(in: yamlString)
@@ -307,12 +339,18 @@ final class ConfigManager: @unchecked Sendable {
         let decoder = YAMLDecoder()
         do {
             let decodedConfig = try decoder.decode(AppConfig.self, from: yamlString)
+            try ConfigValidator.validate(decodedConfig)
             lock.lock()
             defer { lock.unlock() }
             self._config = decodedConfig
             self._configWarning = unknownKeysWarning
+            self._activeConfigPath = configPath
+        } catch let error as ConfigError {
+            throw error
         } catch {
-            throw ConfigError.decodingError(error)
+            // Decoder diagnostics can contain the original YAML, including credentials.
+            throw ConfigError.decodingError(NSError(domain: "ConfigManager", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "Cannot decode configuration; check YAML syntax and value types"]))
         }
     }
 
@@ -325,7 +363,7 @@ final class ConfigManager: @unchecked Sendable {
     }
 
     /// Known keys at each level of the config
-    private static let knownRootKeys: Set<String> = ["servers", "local_server_port"]
+    private static let knownRootKeys: Set<String> = ["servers", "local_server_port", "local_server_token"]
     private static let knownServerKeys: Set<String> = ["url", "token", "topics", "allowed_schemes", "allowed_domains", "fetch_missed"]
     private static let knownTopicKeys: Set<String> = ["name", "icon_path", "icon_symbol", "auto_run_script", "silent", "click_url", "actions", "fetch_missed"]
     private static let knownActionKeys: Set<String> = ["title", "type", "path", "url", "name", "script"]
@@ -388,43 +426,13 @@ final class ConfigManager: @unchecked Sendable {
         return warnings.joined(separator: "\n")
     }
 
-    /// Validates that the config file has secure permissions (not world-writable)
-    private func validateFilePermissions(at path: String) throws {
-        let fileManager = FileManager.default
-        let attributes = try fileManager.attributesOfItem(atPath: path)
-
-        guard let posixPermissions = attributes[.posixPermissions] as? Int else {
-            return  // Can't determine permissions, allow
-        }
-
-        // Check if world-writable (others have write permission: ----w--w-)
-        // POSIX permission bits: owner (rwx), group (rwx), others (rwx)
-        // World-writable means the last octet has write bit (0o002)
-        let worldWritable = (posixPermissions & 0o002) != 0
-
-        if worldWritable {
-            throw ConfigError.insecureFilePermissions(
-                "Config file at \(path) is world-writable (permissions: \(String(posixPermissions, radix: 8))). " +
-                "Please run: chmod o-w \"\(path)\""
-            )
-        }
-    }
-
     /// Creates a sample configuration file at the specified path
     static func createSampleConfig(at path: String? = nil) throws {
         let configPath = path ?? defaultConfigPath
-        let url = URL(fileURLWithPath: configPath)
-        let directory = url.deletingLastPathComponent()
-
-        try FileManager.default.createDirectory(
-            at: directory,
-            withIntermediateDirectories: true,
-            attributes: nil
-        )
-
         let sampleYAML = """
         # ntfy-macos configuration file
         # local_server_port: 9292  # optional: enable local HTTP server for script-triggered notifications
+        # local_server_token: ... # required with local_server_port; generate with: openssl rand -hex 32
         servers:
           - url: https://ntfy.sh
             # token: your_token_here  # optional, or use 'ntfy-macos auth add'
@@ -459,7 +467,7 @@ final class ConfigManager: @unchecked Sendable {
                 silent: true
         """
 
-        try sampleYAML.write(to: url, atomically: true, encoding: .utf8)
+        try SecureConfigFile.write(sampleYAML, to: configPath, replacingExisting: false)
     }
 
     /// Retrieves the authentication token for a specific server
@@ -482,6 +490,11 @@ final class ConfigManager: @unchecked Sendable {
 
     /// Finds a topic configuration by name (searches all servers)
     func topicConfig(for topicName: String) -> TopicConfig? {
-        return config?.allTopics.first { $0.name == topicName }
+        let matches = config?.allTopics.filter { $0.name == topicName } ?? []
+        return matches.count == 1 ? matches.first : nil
+    }
+
+    func topicConfig(for topicName: String, serverURL: String) -> TopicConfig? {
+        config?.serverConfig(forURL: serverURL, topic: topicName)?.topics.first { $0.name == topicName }
     }
 }

@@ -8,11 +8,13 @@ struct EditableServer: Identifiable {
     var storeInKeychain: Bool
     var fetchMissed: Bool
     var topics: [EditableTopic]
+    var allowedSchemes: [String]?
+    var allowedDomains: [String]?
 
     // Track original URL for Keychain cleanup on rename
     var originalUrl: String?
 
-    init(id: UUID = UUID(), url: String = "", token: String = "", storeInKeychain: Bool = false, fetchMissed: Bool = false, topics: [EditableTopic] = [], originalUrl: String? = nil) {
+    init(id: UUID = UUID(), url: String = "", token: String = "", storeInKeychain: Bool = false, fetchMissed: Bool = false, topics: [EditableTopic] = [], originalUrl: String? = nil, allowedSchemes: [String]? = nil, allowedDomains: [String]? = nil) {
         self.id = id
         self.url = url
         self.token = token
@@ -20,6 +22,8 @@ struct EditableServer: Identifiable {
         self.fetchMissed = fetchMissed
         self.topics = topics
         self.originalUrl = originalUrl
+        self.allowedSchemes = allowedSchemes
+        self.allowedDomains = allowedDomains
     }
 }
 
@@ -53,6 +57,7 @@ struct EditableTopic: Identifiable {
 class SettingsViewModel: ObservableObject {
     @Published var servers: [EditableServer] = []
     @Published var localServerPort: String = ""
+    @Published private(set) var localServerToken: String?
     @Published var selectedServerID: UUID?
     @Published var hasUnsavedChanges: Bool = false
     @Published var isLocked: Bool = true
@@ -69,8 +74,20 @@ class SettingsViewModel: ObservableObject {
     }
 
     private var cancellables = Set<AnyCancellable>()
+    private let configManager: ConfigManager
+    private let loadToken: (String) throws -> String?
+    private let saveToken: (String, String) throws -> Void
+    private let deleteToken: (String) throws -> Void
+    private var credentialLoadFailed = false
 
-    init() {
+    init(configManager: ConfigManager = .shared,
+         loadToken: @escaping (String) throws -> String? = KeychainHelper.getToken(forServer:),
+         saveToken: @escaping (String, String) throws -> Void = KeychainHelper.saveToken(_:forServer:),
+         deleteToken: @escaping (String) throws -> Void = KeychainHelper.deleteToken(forServer:)) {
+        self.configManager = configManager
+        self.loadToken = loadToken
+        self.saveToken = saveToken
+        self.deleteToken = deleteToken
         // Track changes to mark unsaved state
         $servers
             .dropFirst()
@@ -83,7 +100,9 @@ class SettingsViewModel: ObservableObject {
     }
 
     func loadFromConfig() {
-        let config = ConfigManager.shared.config
+        let config = configManager.config
+        localServerToken = config?.localServerToken
+        credentialLoadFailed = false
 
         if let port = config?.localServerPort {
             localServerPort = String(port)
@@ -93,7 +112,9 @@ class SettingsViewModel: ObservableObject {
 
         servers = (config?.servers ?? []).map { server in
             // Check if token is stored in Keychain
-            let keychainToken = try? KeychainHelper.getToken(forServer: server.url)
+            let keychainToken: String?
+            do { keychainToken = try loadToken(server.url) }
+            catch { credentialLoadFailed = true; keychainToken = nil }
             let hasKeychainToken = keychainToken != nil
             let tokenValue = keychainToken ?? server.token ?? ""
 
@@ -114,7 +135,9 @@ class SettingsViewModel: ObservableObject {
                         actions: topic.actions
                     )
                 },
-                originalUrl: server.url
+                originalUrl: server.url,
+                allowedSchemes: server.allowedSchemes,
+                allowedDomains: server.allowedDomains
             )
         }
 
@@ -122,11 +145,15 @@ class SettingsViewModel: ObservableObject {
         selectedServerID = servers.first?.id
 
         hasUnsavedChanges = false
-        saveError = nil
+        saveError = credentialLoadFailed ? "Cannot read Keychain credentials. Unlock Keychain and reload Settings before saving." : nil
     }
 
     func save() {
         saveError = nil
+        guard !credentialLoadFailed else {
+            saveError = "Cannot save while Keychain credentials are inaccessible. Unlock Keychain and reload Settings."
+            return
+        }
 
         // Validation
         for server in servers {
@@ -152,10 +179,10 @@ class SettingsViewModel: ObservableObject {
         let port: UInt16?
         if localServerPort.trimmingCharacters(in: .whitespaces).isEmpty {
             port = nil
-        } else if let p = UInt16(localServerPort) {
+        } else if let p = UInt16(localServerPort), p >= 1024 {
             port = p
         } else {
-            saveError = "Invalid port number"
+            saveError = "Port must be between 1024 and 65535"
             return
         }
 
@@ -181,35 +208,36 @@ class SettingsViewModel: ObservableObject {
                 url: server.url,
                 token: yamlToken,
                 topics: topicConfigs,
+                allowedSchemes: server.allowedSchemes,
+                allowedDomains: server.allowedDomains,
                 fetchMissed: server.fetchMissed ? true : nil
             )
         }
 
-        let appConfig = AppConfig(servers: serverConfigs, localServerPort: port)
+        let savedLocalToken = port == nil ? localServerToken : (localServerToken ?? LocalNotificationServer.generateToken())
+        let appConfig = AppConfig(servers: serverConfigs, localServerPort: port, localServerToken: savedLocalToken)
 
-        // Handle Keychain operations
-        for server in servers {
-            let token = server.token.trimmingCharacters(in: .whitespaces)
-
-            if server.storeInKeychain && !token.isEmpty {
-                try? KeychainHelper.saveToken(token, forServer: server.url)
-
-                // If URL changed, clean up old Keychain entry
-                if let oldUrl = server.originalUrl, oldUrl != server.url {
-                    try? KeychainHelper.deleteToken(forServer: oldUrl)
-                }
-            } else if !server.storeInKeychain {
-                // Remove from Keychain if user unchecked the option
-                if let oldUrl = server.originalUrl {
-                    try? KeychainHelper.deleteToken(forServer: oldUrl)
-                }
-                try? KeychainHelper.deleteToken(forServer: server.url)
-            }
-        }
-
-        // Write YAML
+        var configurationSaved = false
         do {
-            try ConfigManager.saveConfig(appConfig)
+            try ConfigValidator.validate(appConfig)
+            // Never silently drop a credential when a Keychain write fails.
+            for server in servers where server.storeInKeychain && !server.token.isEmpty {
+                try saveToken(server.token, server.url)
+            }
+            try ConfigManager.saveConfig(appConfig, to: configManager.activeConfigPath)
+            configurationSaved = true
+            // Remove obsolete entries only after the replacement config is durable.
+            let retainedKeychainURLs = Set(servers.filter { $0.storeInKeychain && !$0.token.isEmpty }.map { $0.url })
+            for server in servers {
+                if let oldURL = server.originalUrl,
+                   !retainedKeychainURLs.contains(oldURL) {
+                    try deleteToken(oldURL)
+                }
+                if !retainedKeychainURLs.contains(server.url) {
+                    try deleteToken(server.url)
+                }
+            }
+            localServerToken = savedLocalToken
             hasUnsavedChanges = false
 
             // Update originalUrl for all servers after successful save
@@ -220,8 +248,19 @@ class SettingsViewModel: ObservableObject {
             hasUnsavedChanges = false
             isLocked = true
         } catch {
-            saveError = "Failed to save: \(error.localizedDescription)"
+            saveError = configurationSaved
+                ? "Configuration saved, but Keychain cleanup failed. Old credentials may still be active; unlock Keychain and retry."
+                : "Failed to save: \(error.localizedDescription)"
         }
+    }
+
+    var activeConfigPath: String { configManager.activeConfigPath }
+
+    /// Only expose a valid, saved command; its token is a deliberate clipboard export.
+    var localServerCurlCommand: String? {
+        guard !hasUnsavedChanges, let port = UInt16(localServerPort), port >= 1024,
+              let token = localServerToken, ConfigValidator.isValidLocalServerToken(token) else { return nil }
+        return "curl --fail-with-body -X POST http://127.0.0.1:\(port)/notify -H 'Authorization: Bearer \(token)' -H 'Content-Type: application/json' -d '{\"title\":\"Hello\",\"message\":\"Hello from ntfy-macos!\"}'"
     }
 
     func cancel() {

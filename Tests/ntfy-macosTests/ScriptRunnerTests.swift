@@ -121,14 +121,14 @@ final class ScriptRunnerTests: XCTestCase {
 
     func testRunScriptWithSpecialCharactersInArgument() throws {
         let scriptPath = tempDir.appendingPathComponent("special-chars.sh")
-        try "#!/bin/bash\necho \"Arg: $1\"".write(to: scriptPath, atomically: true, encoding: .utf8)
+        try "#!/bin/bash\nprintf '%s' \"$1\"".write(to: scriptPath, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptPath.path)
 
-        let specialArg = "Hello 'World' with \"quotes\" and $pecial chars!"
+        let specialArg = "Hello 'World' with \"quotes\", $(printf INJECTED), `printf INJECTED`, \\ and $pecial chars!\nnext line; # comment"
         let result = runner.runScriptSynchronously(at: scriptPath.path, withArgument: specialArg)
 
         XCTAssertEqual(result.exitCode, 0)
-        XCTAssertTrue(result.output.contains("Hello"))
+        XCTAssertEqual(result.output, specialArg)
     }
 
     func testRunScriptWithUnicodeArgument() throws {

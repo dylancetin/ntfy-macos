@@ -5,10 +5,11 @@ import Network
 final class LocalNotificationServerTests: XCTestCase {
     var server: LocalNotificationServer!
     let testPort: UInt16 = 19292  // Use a non-standard port for tests
+    let token = String(repeating: "a", count: 64)
 
     override func setUp() {
         super.setUp()
-        server = LocalNotificationServer(port: testPort)
+        server = LocalNotificationServer(port: testPort, authToken: token)
         server.onNotification = nil  // Disable actual notifications in tests
         try? server.start()
         // Give the server time to start
@@ -25,7 +26,9 @@ final class LocalNotificationServerTests: XCTestCase {
 
     // MARK: - Helpers
 
-    private func sendRequest(method: String = "POST", path: String = "/notify", body: String? = nil) -> (statusCode: Int, body: String)? {
+    private func sendRequest(method: String = "POST", path: String = "/notify", body: String? = nil,
+                             authorized: Bool = true, contentType: String = "application/json",
+                             extraHeaders: [String: String] = [:]) -> (statusCode: Int, body: String)? {
         let expectation = XCTestExpectation(description: "HTTP request")
         nonisolated(unsafe) var resultStatus: Int = 0
         nonisolated(unsafe) var resultBody: String = ""
@@ -37,7 +40,9 @@ final class LocalNotificationServerTests: XCTestCase {
 
         var request = URLRequest(url: url)
         request.httpMethod = method
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(contentType, forHTTPHeaderField: "Content-Type")
+        if authorized { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
+        for (name, value) in extraHeaders { request.setValue(value, forHTTPHeaderField: name) }
         if let body = body {
             request.httpBody = body.data(using: .utf8)
         }
@@ -136,5 +141,34 @@ final class LocalNotificationServerTests: XCTestCase {
     func testGetOnNotify() throws {
         let result = sendRequest(method: "GET", path: "/notify")
         XCTAssertEqual(result?.statusCode, 404)
+    }
+
+    func testUnauthenticatedNotificationAndHealthRejected() {
+        XCTAssertEqual(sendRequest(body: "{\"title\":\"test\",\"message\":\"body\"}", authorized: false)?.statusCode, 401)
+        XCTAssertEqual(sendRequest(method: "GET", path: "/health", authorized: false)?.statusCode, 401)
+    }
+
+    func testWrongBearerTokenRejected() {
+        XCTAssertEqual(sendRequest(body: "{}", extraHeaders: ["Authorization": "Bearer wrong"])?.statusCode, 401)
+    }
+
+    func testBrowserOriginAndTextPlainRejected() {
+        XCTAssertEqual(sendRequest(body: "{}", extraHeaders: ["Origin": "https://evil.example"])?.statusCode, 403)
+        XCTAssertEqual(sendRequest(body: "{}", contentType: "text/plain")?.statusCode, 415)
+    }
+
+    func testLocalPayloadCannotAttachActions() {
+        let notification = expectation(description: "local notification")
+        server.onNotification = { message in
+            XCTAssertNil(message.actions)
+            XCTAssertNil(message.click)
+            XCTAssertEqual(message.topic, "local")
+            notification.fulfill()
+        }
+        let body = """
+        {"title":"test","message":"body","click":"file:///tmp/payload","actions":[{"action":"script","url":"file:///tmp/payload"}]}
+        """
+        XCTAssertEqual(sendRequest(body: body)?.statusCode, 200)
+        wait(for: [notification], timeout: 2)
     }
 }

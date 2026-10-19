@@ -2,10 +2,10 @@
 # Deploy application after CI/CD success notification
 # Triggered by: github-actions topic action button
 
-LOG_FILE="/tmp/deploy.log"
-MESSAGE="$1"
+# Command output is not persisted; avoid shared /tmp logs and notification text.
+LOG_FILE="/dev/null"
 
-echo "$(date): Deploy triggered: $MESSAGE" >> "$LOG_FILE"
+echo "$(date): Deploy triggered" >> "$LOG_FILE"
 
 # Example: Deploy via SSH
 # ssh deploy@server.example.com "cd /app && git pull && docker-compose up -d" >> "$LOG_FILE" 2>&1

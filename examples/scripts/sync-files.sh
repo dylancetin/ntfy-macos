@@ -2,10 +2,10 @@
 # Sync files to remote server or cloud storage
 # Triggered by: sync-trigger topic (silent)
 
-LOG_FILE="/tmp/sync.log"
-MESSAGE="$1"
+# Command output is not persisted; avoid shared /tmp logs and notification text.
+LOG_FILE="/dev/null"
 
-echo "$(date): Sync triggered: $MESSAGE" >> "$LOG_FILE"
+echo "$(date): Sync triggered" >> "$LOG_FILE"
 
 # Example: Sync to remote server via rsync
 # rsync -avz --delete ~/Documents/ user@server:/backup/Documents/ >> "$LOG_FILE" 2>&1

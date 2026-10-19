@@ -1,12 +1,14 @@
 # ntfy-macos
 
-[![Build & Test](https://github.com/laurentftech/ntfy-macos/actions/workflows/build.yml/badge.svg)](https://github.com/laurentftech/ntfy-macos/actions/workflows/build.yml)
+[![Build & Test](https://github.com/dylancetin/ntfy-macos/actions/workflows/build.yml/badge.svg)](https://github.com/dylancetin/ntfy-macos/actions/workflows/build.yml)
 [![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-support-yellow?style=flat&logo=buy-me-a-coffee)](https://buymeacoffee.com/laurentftech)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![macOS 13+](https://img.shields.io/badge/macOS-13%2B-brightgreen.svg)](https://www.apple.com/macos/)
 [![Swift 6](https://img.shields.io/badge/Swift-6-orange.svg)](https://swift.org/)
-[![Homebrew](https://img.shields.io/badge/Homebrew-tap-brown.svg)](https://github.com/laurentftech/homebrew-ntfy-macos)
-[![Tests](https://img.shields.io/badge/Tests-177-brightgreen.svg)]()
+
+**Security-hardened fork of [laurentftech/ntfy-macos](https://github.com/laurentftech/ntfy-macos).**
+See [Mac build / local-agent instructions](docs/BUILD_ON_MAC.md) and the
+[security changes and migration guide](docs/SECURITY_HARDENING.md).
 
 Receive push notifications on your Mac from any source — servers, IoT devices, home automation, CI pipelines, or custom scripts. No account required, works with the public [ntfy.sh](https://ntfy.sh) service or your own self-hosted server.
 
@@ -35,41 +37,36 @@ Receive push notifications on your Mac from any source — servers, IoT devices,
 
 ## Installation
 
-### Using Homebrew
-
-```bash
-# Add the tap
-brew tap laurentftech/ntfy-macos
-
-# Install
-brew install ntfy-macos
-```
+The original author's Homebrew tap installs the upstream version, **not this fork's fixes**.
+Build this fork from source using the steps below or the detailed [Mac handoff](docs/BUILD_ON_MAC.md).
 
 ### Build from Source
 
 ```bash
 # Clone the repository
-git clone https://github.com/laurentftech/ntfy-macos.git
+git clone https://github.com/dylancetin/ntfy-macos.git
 cd ntfy-macos
 
-# Build the app bundle
+# Test and build using the pinned dependency
+swift test --force-resolved-versions
 ./build-app.sh
 
-# Install
-sudo cp -r .build/release/ntfy-macos.app /Applications/
+# Install for the current user
+mkdir -p "$HOME/Applications"
+ditto .build/release/ntfy-macos.app "$HOME/Applications/ntfy-macos.app"
 ```
 
 ### Updating
 
 ```bash
-# Update via Homebrew
-brew update && brew upgrade ntfy-macos
-
-# Restart the service to apply the update
-brew services restart ntfy-macos
+# In this fork's checkout, after stopping the running app:
+git pull --ff-only
+swift test --force-resolved-versions
+./build-app.sh
+ditto .build/release/ntfy-macos.app "$HOME/Applications/ntfy-macos.app"
 ```
 
-**Note**: Homebrew installation requires Xcode (not just Command Line Tools) because the app is built from source.
+**Note**: Use Xcode with Swift 6 or newer. See the build guide for toolchain selection and signing details.
 
 ## Quick Start
 
@@ -79,7 +76,8 @@ brew services restart ntfy-macos
 ntfy-macos init
 ```
 
-This creates a sample configuration at `~/.config/ntfy-macos/config.yml`.
+This creates a private sample configuration at `~/.config/ntfy-macos/config.yml` without overwriting an existing file.
+Use the binary at `$HOME/Applications/ntfy-macos.app/Contents/MacOS/ntfy-macos`, or add its directory to your PATH.
 
 2. **Edit Configuration**
 
@@ -109,10 +107,7 @@ ntfy-macos auth add https://ntfy.sh tk_yourtoken
 4. **Start the Service**
 
 ```bash
-# Using Homebrew services (recommended - auto-restarts on crash)
-brew services start ntfy-macos
-
-# Or run directly
+# Run the patched binary directly (stop an older Homebrew service first if applicable)
 ntfy-macos serve
 ```
 
@@ -130,7 +125,7 @@ The app runs in the menu bar with options to:
 5. **(Optional) Add to Launchpad**
 
 ```bash
-sudo ln -sf /usr/local/opt/ntfy-macos/ntfy-macos.app /Applications/
+open "$HOME/Applications/ntfy-macos.app"
 ```
 
 ## Configuration
@@ -164,13 +159,16 @@ servers:
 
 #### Global Fields
 
-- `local_server_port` (optional): Port for the local notification HTTP server (e.g., `9292`). Disabled if omitted.
+- `local_server_port` (optional): Port 1024–65535 for the authenticated local notification HTTP server. Disabled if omitted.
+- `local_server_token` (required when the local server is enabled): A private bearer token of 32–256 ASCII letters, digits, `_` or `-`. Generate one with `openssl rand -hex 32`, or enable the port and Save in Settings to generate it automatically.
 
 #### Server Fields
 
 - `url` (required): Server URL
 - `token` (optional): Authentication token
 - `topics` (required): List of topics
+- `allowed_schemes` (optional): Allowed URL schemes; defaults to HTTP/HTTPS. Prefer `[https]`.
+- `allowed_domains` (optional): Allowed destination hosts, with optional `*.example.com` patterns. HTTP action buttons require an explicit nonempty allowlist; `[]` denies all destinations. Browser-opening actions retain the upstream unrestricted-domain default when omitted.
 
 #### Topic Fields
 
@@ -204,7 +202,7 @@ Here’s a summary of how actions are handled:
 | applescript | ❌             | ❌ Blocked               | ✅ Supported                 |
 | shortcut    | ❌             | ❌ Blocked               | ✅ Supported                 |
 
-> `script`, `applescript`, and `shortcut` actions are **only available via config.yml** — they cannot be triggered from message payloads. This prevents remote code execution.
+> `script`, `applescript`, and `shortcut` commands are **only selected from local config.yml**. Publishers can still trigger configured automation and supply its input, so scripts must handle that input as untrusted data. HTTP actions enforce destination policies and reject redirects.
 
 **Note:** `applescript` and `shortcut` are **ntfy-macos client-specific action types**. Only `view`, `http`, `broadcast`, and `dismiss` are part of the official ntfy protocol.
 
@@ -299,7 +297,7 @@ chmod +x /path/to/your/script.sh
 
 ### Security Considerations
 
-Scripts are **only executed if explicitly configured** in your local `config.yml` file. ntfy-macos will never execute arbitrary code from incoming messages.
+Scripts are **only selected from your local `config.yml`**, scoped to the originating server and subscribed topic. Configured scripts run with your privileges and can still misuse untrusted message text. The application does not provide an OS sandbox for those scripts.
 
 **Best practices:**
 - Only configure scripts that you trust and have reviewed
@@ -349,10 +347,11 @@ flowchart LR
 
 ### Setup
 
-Add `local_server_port` to the root of your `config.yml`:
+Generate a token with `openssl rand -hex 32`. Add the port and generated token to your private `config.yml`, or enable the port and Save in Settings:
 
 ```yaml
 local_server_port: 9292
+local_server_token: ... # replace with the generated token; this placeholder is intentionally invalid
 
 servers:
   - url: https://ntfy.sh
@@ -362,10 +361,11 @@ servers:
 
 ### Usage
 
-Send a POST request to trigger a notification:
+Set `NTFY_LOCAL_TOKEN` in your local script environment to the configured token (do not publish it). Send an authenticated JSON POST, or copy the ready-to-use command from Settings after saving:
 
 ```bash
 curl -X POST http://127.0.0.1:9292/notify \
+  -H "Authorization: Bearer $NTFY_LOCAL_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"title": "Build Complete", "message": "Project compiled successfully", "priority": 3, "tags": ["white_check_mark"]}'
 ```
@@ -381,7 +381,7 @@ curl -X POST http://127.0.0.1:9292/notify \
 | `priority` | integer  | No       | Priority 1-5 (maps to macOS levels)      |
 | `tags`     | string[] | No       | Emoji tags (e.g., `["warning", "fire"]`) |
 
-**GET /health** - Returns `{"status": "ok"}` for health checks.
+**GET /health** - Returns `{"status": "ok"}` for authenticated health checks. Both endpoints require the bearer token. Browser-origin requests are rejected.
 
 ### Example: Auto-run Script with Local Notifications
 
@@ -392,15 +392,15 @@ Combine `auto_run_script` with the local server to create rich feedback loops:
 # auto_run_script for topic "deployments"
 # Receives message via $1 and env vars, then triggers a local follow-up notification
 
-RESULT=$(deploy.sh "$NTFY_MESSAGE" 2>&1)
-EXIT_CODE=$?
-
-if [ $EXIT_CODE -eq 0 ]; then
+: "${NTFY_LOCAL_TOKEN:?Configure the private local API token in this script's environment}"
+if deploy.sh "$NTFY_MESSAGE"; then
   curl -s -X POST http://127.0.0.1:9292/notify \
-    -d "{\"title\": \"Deploy Success\", \"message\": \"$NTFY_MESSAGE deployed successfully\", \"tags\": [\"white_check_mark\"]}"
+    -H "Authorization: Bearer $NTFY_LOCAL_TOKEN" -H 'Content-Type: application/json' \
+    -d '{"title":"Deploy Success","message":"Deployment completed","tags":["white_check_mark"]}'
 else
   curl -s -X POST http://127.0.0.1:9292/notify \
-    -d "{\"title\": \"Deploy Failed\", \"message\": \"$RESULT\", \"priority\": 4, \"tags\": [\"x\"]}"
+    -H "Authorization: Bearer $NTFY_LOCAL_TOKEN" -H 'Content-Type: application/json' \
+    -d '{"title":"Deploy Failed","message":"Check deployment status","priority":4,"tags":["x"]}'
 fi
 ```
 
@@ -408,8 +408,10 @@ fi
 
 - Binds to `127.0.0.1` only (not accessible from the network)
 - Maximum request body size: 4 KB
+- Requires a bearer token, exact loopback Host header, and JSON Content-Type; rejects browser origins and ambiguous HTTP framing
+- Maximum 16 simultaneous connections, five-second request deadline, and 60 authenticated requests per minute
 - No code execution - only triggers notifications
-- Disabled by default (requires `local_server_port` in config)
+- Disabled by default (requires `local_server_port` and `local_server_token` in config)
 - Configure via Settings window (click lock to edit, enter port)
 - Test your setup with the built-in curl example (click Copy button)
 
@@ -477,7 +479,8 @@ MIT License
 
 ## Credits
 
-This project is a third-party client for [ntfy](https://ntfy.sh), created by [Philipp C. Heckel](https://github.com/binwiederhier).
+Original macOS client by [laurentftech](https://github.com/laurentftech/ntfy-macos). This fork adds security hardening.
+The project is a third-party client for [ntfy](https://ntfy.sh), created by [Philipp C. Heckel](https://github.com/binwiederhier).
 
 ## Related Projects
 

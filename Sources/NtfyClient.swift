@@ -1,14 +1,21 @@
 import Foundation
 import Network
 
-@preconcurrency protocol NtfyClientDelegate: AnyObject {
+enum NetworkAuthenticationPolicy {
+    static func disposition(for authenticationMethod: String) -> URLSession.AuthChallengeDisposition {
+        // Let the system validate TLS certificates; never use keychain/ambient auth credentials.
+        authenticationMethod == NSURLAuthenticationMethodServerTrust ? .performDefaultHandling : .cancelAuthenticationChallenge
+    }
+}
+
+@MainActor protocol NtfyClientDelegate: AnyObject {
     func ntfyClient(_ client: NtfyClient, didReceiveMessage message: NtfyMessage)
     func ntfyClient(_ client: NtfyClient, didEncounterError error: Error)
     func ntfyClientDidConnect(_ client: NtfyClient)
     func ntfyClientDidDisconnect(_ client: NtfyClient)
 }
 
-struct NtfyMessage: Codable {
+struct NtfyMessage: Codable, Sendable {
     let id: String
     let time: Int
     let event: String
@@ -46,7 +53,7 @@ struct NtfyMessage: Codable {
         return MarkdownStripper.strip(title)
     }
 
-    struct NtfyAction: Codable {
+    struct NtfyAction: Codable, Sendable {
         let action: String
         let label: String
         let url: String?
@@ -56,7 +63,7 @@ struct NtfyMessage: Codable {
         let clear: Bool?
     }
 
-    struct NtfyAttachment: Codable {
+    struct NtfyAttachment: Codable, Sendable {
         let name: String
         let url: String
         let type: String?
@@ -65,11 +72,50 @@ struct NtfyMessage: Codable {
     }
 }
 
+/// Consumes records individually, never copying an unbounded network chunk into storage.
+struct BoundedNDJSONBuffer {
+    enum BufferError: Error { case recordTooLarge }
+    static let defaultLimit = 256 * 1024
+    let limit: Int
+    private(set) var pending = Data()
+
+    init(limit: Int = Self.defaultLimit) {
+        precondition(limit > 0)
+        self.limit = limit
+    }
+
+    mutating func reset() { pending = Data() }
+
+    mutating func append(_ data: Data, onRecord: (Data) -> Void) throws {
+        var start = data.startIndex
+        while start < data.endIndex {
+            let newline = data[start...].firstIndex(of: 10)
+            let end = newline ?? data.endIndex
+            let count = data.distance(from: start, to: end)
+            guard count <= limit - pending.count else {
+                reset()
+                throw BufferError.recordTooLarge
+            }
+            pending.append(contentsOf: data[start..<end])
+            if let newline {
+                let record = pending
+                pending = Data()
+                onRecord(record)
+                start = data.index(after: newline)
+            } else {
+                break
+            }
+        }
+    }
+}
+
 final class NtfyClient: NSObject, @unchecked Sendable {
-    private let serverURL: String
+    /// Immutable subscription origin; never derived from publisher-controlled fields.
+    let serverURL: String
     private let topics: [String]
     private let fetchMissed: Bool
-    private let lock = NSLock()
+    // All mutable connection state is protected by this lock, including timer callbacks.
+    private let lock = NSRecursiveLock()
     private var _authToken: String?
 
     private var authToken: String? {
@@ -90,7 +136,10 @@ final class NtfyClient: NSObject, @unchecked Sendable {
     private var session: URLSession!
     private let delegateQueue: OperationQueue
     private var dataTask: URLSessionDataTask?
-    private var buffer = Data()
+    private var buffer = BoundedNDJSONBuffer()
+    private var generation: UInt64 = 0
+    private var pendingCallbacks = 0
+    private let maxPendingCallbacks = 128
 
     private var reconnectAttempts = 0
     private let maxReconnectAttempts = 10
@@ -110,6 +159,7 @@ final class NtfyClient: NSObject, @unchecked Sendable {
 
     // Network path monitor: reconnect immediately when network becomes available
     private var pathMonitor: NWPathMonitor?
+    private var pathMonitorGeneration: UInt64 = 0
     private var isPathSatisfied = true  // Assume connected initially
 
     init(serverURL: String, topics: [String], authToken: String? = nil, fetchMissed: Bool = false, watchdogInterval: TimeInterval = 120.0, baseReconnectDelay: TimeInterval = 2.0, urlSessionConfiguration: URLSessionConfiguration? = nil) {
@@ -132,10 +182,14 @@ final class NtfyClient: NSObject, @unchecked Sendable {
 
         super.init()
 
-        let config = urlSessionConfiguration ?? URLSessionConfiguration.default
+        let config = urlSessionConfiguration ?? URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = .infinity
         config.timeoutIntervalForResource = .infinity
         config.httpMaximumConnectionsPerHost = 1
+        config.httpShouldSetCookies = false
+        config.httpCookieStorage = nil
+        config.urlCredentialStorage = nil
+        config.urlCache = nil
         self.session = URLSession(configuration: config, delegate: self, delegateQueue: delegateQueue)
     }
 
@@ -144,24 +198,47 @@ final class NtfyClient: NSObject, @unchecked Sendable {
     }
 
     // Thread-safe delegate call helper
-    private func callDelegate(_ block: @escaping @Sendable (NtfyClientDelegate) -> Void) {
+    private func callDelegate(_ block: @escaping @MainActor @Sendable (NtfyClientDelegate) -> Void) {
+        // Caller holds lock. Bound queued delivery too, not only partial wire records.
+        guard pendingCallbacks < maxPendingCallbacks else { return }
+        pendingCallbacks += 1
+        let expectedGeneration = generation
         DispatchQueue.main.async { [weak self] in
-            guard let self = self, let delegate = self.delegate else { return }
+            guard let self else { return }
+            self.lock.lock()
+            defer { self.lock.unlock() }
+            self.pendingCallbacks -= 1
+            guard self.shouldReconnect, self.generation == expectedGeneration,
+                  let delegate = self.delegate else { return }
             block(delegate)
         }
     }
 
+    func isSubscribed(to topic: String) -> Bool { topics.contains(topic) }
+
     func connect() {
-        guard !isConnecting else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        guard shouldReconnect, !isConnecting, dataTask == nil else { return }
+        reconnectTimer?.invalidate()
+        reconnectTimer = nil
         isConnecting = true
+        generation &+= 1
 
         let topicsString = topics.joined(separator: ",")
-        guard var components = URLComponents(string: serverURL) else {
+        guard var components = URLComponents(string: serverURL),
+              ["http", "https"].contains(components.scheme?.lowercased() ?? ""),
+              let host = components.host, !host.isEmpty,
+              components.user == nil, components.password == nil,
+              !topics.isEmpty else {
             isConnecting = false
             return
         }
 
-        components.path = "/\(topicsString)/json"
+        let basePath = components.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        components.path = (basePath.isEmpty ? "" : "/\(basePath)") + "/\(topicsString)/json"
+        components.query = nil
+        components.fragment = nil
 
         // Add since parameter to fetch missed messages when enabled
         if fetchMissed {
@@ -180,6 +257,7 @@ final class NtfyClient: NSObject, @unchecked Sendable {
         }
 
         var request = URLRequest(url: url)
+        request.httpShouldHandleCookies = false
         request.httpMethod = "GET"
         request.setValue("application/x-ndjson", forHTTPHeaderField: "Accept")
 
@@ -189,15 +267,18 @@ final class NtfyClient: NSObject, @unchecked Sendable {
 
         startPathMonitor()
 
-        buffer.removeAll()
+        buffer.reset()
         dataTask = session.dataTask(with: request)
         dataTask?.resume()
 
-        Log.info("Connecting to ntfy: \(url.absoluteString)")
+        Log.info("Connecting to ntfy subscription")
     }
 
     func disconnect() {
+        lock.lock()
+        defer { lock.unlock() }
         shouldReconnect = false
+        generation &+= 1
         reconnectTimer?.invalidate()
         reconnectTimer = nil
         stopWatchdog()
@@ -205,16 +286,24 @@ final class NtfyClient: NSObject, @unchecked Sendable {
         dataTask?.cancel()
         dataTask = nil
         isConnecting = false
-        buffer.removeAll()
+        buffer.reset()
+        session?.invalidateAndCancel()
     }
 
     private func startWatchdog() {
         stopWatchdog()
         lastDataReceived = Date()
+        let expectedGeneration = generation
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
+            self.lock.lock()
+            defer { self.lock.unlock() }
+            guard self.shouldReconnect, self.generation == expectedGeneration, self.dataTask != nil else { return }
             self.watchdogTimer = Timer.scheduledTimer(withTimeInterval: self.watchdogInterval, repeats: true) { [weak self] _ in
                 guard let self else { return }
+                self.lock.lock()
+                defer { self.lock.unlock() }
+                guard self.shouldReconnect, self.generation == expectedGeneration else { return }
                 let elapsed = Date().timeIntervalSince(self.lastDataReceived)
                 if elapsed >= self.watchdogInterval {
                     Log.info("Watchdog: no data received for \(Int(elapsed))s, reconnecting...")
@@ -233,8 +322,14 @@ final class NtfyClient: NSObject, @unchecked Sendable {
         guard pathMonitor == nil else { return }
         let monitor = NWPathMonitor()
         pathMonitor = monitor
+        pathMonitorGeneration &+= 1
+        let expectedMonitorGeneration = pathMonitorGeneration
         monitor.pathUpdateHandler = { [weak self] path in
             guard let self else { return }
+            self.lock.lock()
+            defer { self.lock.unlock() }
+            guard self.shouldReconnect, self.pathMonitor != nil,
+                  self.pathMonitorGeneration == expectedMonitorGeneration else { return }
             let satisfied = path.status == .satisfied
             if satisfied && !self.isPathSatisfied {
                 Log.info("Network became available, reconnecting...")
@@ -246,31 +341,40 @@ final class NtfyClient: NSObject, @unchecked Sendable {
     }
 
     private func stopPathMonitor() {
+        pathMonitorGeneration &+= 1
         pathMonitor?.cancel()
         pathMonitor = nil
         isPathSatisfied = true
     }
 
     func updateAuthToken(_ token: String?) {
+        lock.lock()
+        defer { lock.unlock() }
         self.authToken = token
         if dataTask != nil {
             reconnect()
         }
     }
 
-    private func reconnect() {
+    private func reconnect(invalidateCallbacks: Bool = true) {
         guard shouldReconnect else { return }
 
+        if invalidateCallbacks { generation &+= 1 }
+        let expectedGeneration = generation
+        reconnectTimer?.invalidate()
+        reconnectTimer = nil
+        stopWatchdog()
         dataTask?.cancel()
         dataTask = nil
         isConnecting = false
+        buffer.reset()
 
         // Calculate delay with exponential backoff
         var delay: TimeInterval
 
         if let retryAfter = retryAfterDelay {
             // Server told us exactly when to retry (Retry-After header)
-            delay = retryAfter
+            delay = min(retryAfter, maxReconnectDelay)
             retryAfterDelay = nil  // Clear for next time
             Log.info("Server requested retry after \(Int(delay)) seconds")
         } else {
@@ -286,21 +390,24 @@ final class NtfyClient: NSObject, @unchecked Sendable {
 
         if reconnectAttempts <= maxReconnectAttempts {
             Log.info("Reconnecting in \(String(format: "%.1f", delay)) seconds (attempt \(reconnectAttempts)/\(maxReconnectAttempts))...")
-
-            // Schedule timer on main thread to ensure RunLoop is active
-            DispatchQueue.main.async { [weak self] in
-                self?.reconnectTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
-                    self?.connect()
-                }
-            }
         } else {
             // Max attempts reached — schedule a last-resort retry every 5 minutes indefinitely
             Log.error("Max reconnection attempts reached. Retrying every 5 minutes...")
             reconnectAttempts = 0  // Reset so next success resets state correctly
-            DispatchQueue.main.async { [weak self] in
-                self?.reconnectTimer = Timer.scheduledTimer(withTimeInterval: 300.0, repeats: false) { [weak self] _ in
-                    self?.connect()
-                }
+            delay = maxReconnectDelay
+        }
+        let scheduledDelay = delay
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            defer { self.lock.unlock() }
+            guard self.shouldReconnect, self.generation == expectedGeneration else { return }
+            self.reconnectTimer = Timer.scheduledTimer(withTimeInterval: scheduledDelay, repeats: false) { [weak self] _ in
+                guard let self else { return }
+                self.lock.lock()
+                defer { self.lock.unlock() }
+                guard self.shouldReconnect, self.generation == expectedGeneration else { return }
+                self.connect()
             }
         }
     }
@@ -309,7 +416,7 @@ final class NtfyClient: NSObject, @unchecked Sendable {
     /// Internal for testing
     func parseRetryAfter(_ value: String) -> TimeInterval {
         // Try parsing as seconds first
-        if let seconds = TimeInterval(value) {
+        if let seconds = TimeInterval(value), seconds.isFinite {
             return max(seconds, 1.0)  // At least 1 second
         }
 
@@ -337,75 +444,78 @@ final class NtfyClient: NSObject, @unchecked Sendable {
         return 30.0
     }
 
-    private func processLine(_ line: String) {
-        guard !line.isEmpty else { return }
+    private func processLine(_ data: Data) {
+        guard !data.isEmpty, !data.allSatisfy({ [9, 13, 32].contains($0) }) else { return }
 
         do {
-            let data = Data(line.utf8)
             let message = try JSONDecoder().decode(NtfyMessage.self, from: data)
+            guard message.event == "message", isSubscribed(to: message.topic) else { return }
 
-            // Track latest message time for fetch_missed reconnects
-            if message.time > lastMessageTime {
-                lastMessageTime = message.time
-                if fetchMissed {
-                    UserDefaults.standard.set(lastMessageTime, forKey: lastMessageTimeKey)
+            callDelegate { delegate in
+                // Only delivered records may advance replay state; stale/overflowed callbacks cannot.
+                if message.time > self.lastMessageTime {
+                    self.lastMessageTime = message.time
+                    if self.fetchMissed {
+                        UserDefaults.standard.set(self.lastMessageTime, forKey: self.lastMessageTimeKey)
+                    }
                 }
-            }
-
-            if message.event == "message" {
-                callDelegate { delegate in
-                    delegate.ntfyClient(self, didReceiveMessage: message)
-                }
+                delegate.ntfyClient(self, didReceiveMessage: message)
             }
         } catch {
-            Log.error("Failed to decode message: \(error)")
+            Log.error("Discarded malformed stream record")
         }
     }
 }
 
 extension NtfyClient: URLSessionDataDelegate {
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard shouldReconnect, dataTask === self.dataTask else { return }
         lastDataReceived = Date()
-        buffer.append(data)
-
-        while let newlineRange = buffer.range(of: Data("\n".utf8)) {
-            let lineData = buffer.subdata(in: 0..<newlineRange.lowerBound)
-            buffer.removeSubrange(0..<newlineRange.upperBound)
-
-            if let line = String(data: lineData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) {
-                processLine(line)
-            }
+        do {
+            try buffer.append(data) { self.processLine($0) }
+        } catch {
+            Log.error("Stream record exceeded size limit")
+            reconnect()
         }
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard shouldReconnect, task === dataTask else { return }
         isConnecting = false
         stopWatchdog()
 
+        // Preserve records accepted before a natural EOF; replacement tasks get a new generation.
+        reconnect(invalidateCallbacks: false)
         if let error = error {
             let nsError = error as NSError
             // Cancelled errors are expected when we cancel the task ourselves (reconnect/disconnect) — ignore them
             if nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCancelled {
                 return
             }
-            Log.error("Connection error: \(error.localizedDescription)")
+            Log.error("Subscription connection failed (code \(nsError.code))")
             callDelegate { delegate in
                 delegate.ntfyClient(self, didEncounterError: error)
                 delegate.ntfyClientDidDisconnect(self)
             }
-            reconnect()
         } else {
             Log.info("Connection closed by server")
             callDelegate { delegate in
                 delegate.ntfyClientDidDisconnect(self)
             }
-            if shouldReconnect {
-                reconnect()
-            }
         }
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse, completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard shouldReconnect, dataTask === self.dataTask else {
+            completionHandler(.cancel)
+            return
+        }
         guard let httpResponse = response as? HTTPURLResponse else {
             completionHandler(.cancel)
             return
@@ -433,6 +543,20 @@ extension NtfyClient: URLSessionDataDelegate {
             }
 
             completionHandler(.cancel)
+            reconnect()
         }
+    }
+
+    // Never transfer a subscription token or its origin identity across redirects.
+    func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
+        completionHandler(nil)
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didReceive challenge: URLAuthenticationChallenge, completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+        completionHandler(NetworkAuthenticationPolicy.disposition(for: challenge.protectionSpace.authenticationMethod), nil)
+    }
+
+    func urlSession(_ session: URLSession, didReceive challenge: URLAuthenticationChallenge, completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+        completionHandler(NetworkAuthenticationPolicy.disposition(for: challenge.protectionSpace.authenticationMethod), nil)
     }
 }

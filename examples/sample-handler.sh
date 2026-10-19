@@ -5,7 +5,7 @@
 # and ntfy message metadata as environment variables.
 
 # First argument (legacy, still supported)
-MESSAGE="$1"
+MESSAGE="${1:-}"
 
 # Environment variables set by ntfy-macos
 # NTFY_ID       - Unique message ID
@@ -18,23 +18,24 @@ MESSAGE="$1"
 # NTFY_TAGS     - Comma-separated tags (if set)
 # NTFY_CLICK    - Click URL (if set)
 
-TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
-LOG_FILE="$HOME/.ntfy-macos-handler.log"
-
-# Log the message with metadata
-echo "[$TIMESTAMP] Topic: $NTFY_TOPIC | Priority: ${NTFY_PRIORITY:-3} | Message: $NTFY_MESSAGE" >> "$LOG_FILE"
+# Do not persist notification content or metadata in handler logs.
+echo 'Notification handler started'
 
 # Example: Different behavior based on priority
-if [ "${NTFY_PRIORITY:-3}" -ge 4 ]; then
+if [[ "${NTFY_PRIORITY:-3}" =~ ^[45]$ ]] && [ -n "${NTFY_LOCAL_TOKEN:-}" ]; then
     # High priority: send follow-up notification via local server
-    curl -s -X POST http://127.0.0.1:9292/notify \
-        -H "Content-Type: application/json" \
-        -d "{\"title\": \"Script completed\", \"message\": \"Handled high-priority alert from $NTFY_TOPIC\"}" \
-        > /dev/null 2>&1
+    # Set NTFY_LOCAL_TOKEN to the configured local_server_token. Fixed JSON avoids
+    # interpolating remote topic text into JSON; never follow authenticated redirects.
+    case "$NTFY_LOCAL_TOKEN" in *[!A-Za-z0-9_-]*) exit 1 ;; esac
+    printf 'Authorization: Bearer %s\nContent-Type: application/json\n' "$NTFY_LOCAL_TOKEN" |
+        curl --disable --silent --fail --max-time 5 --max-redirs 0 --noproxy '*' \
+            --request POST http://127.0.0.1:9292/notify --header @- \
+            --data '{"title":"Script completed","message":"Handled high-priority alert"}' \
+            > /dev/null 2>&1
 fi
 
 # Example: Different behavior based on topic
-case "$NTFY_TOPIC" in
+case "${NTFY_TOPIC:-}" in
     "backup-trigger")
         /usr/local/bin/run-backup.sh
         ;;
@@ -42,7 +43,7 @@ case "$NTFY_TOPIC" in
         /usr/local/bin/deploy.sh
         ;;
     *)
-        echo "[$TIMESTAMP] No specific handler for topic: $NTFY_TOPIC" >> "$LOG_FILE"
+        echo 'No specific topic handler configured'
         ;;
 esac
 

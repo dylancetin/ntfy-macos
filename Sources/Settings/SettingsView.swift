@@ -147,11 +147,16 @@ struct SettingsView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
 
-                    // curl example with copy
-                    commandRow(
-                        label: "curl",
-                        command: "curl -X POST http://127.0.0.1:\(viewModel.localServerPort)/notify -H \"Content-Type: application/json\" -d '{\"title\": \"Hello\", \"message\": \"Hello from ntfy-macos!\"}'"
-                    )
+                    if let command = viewModel.localServerCurlCommand {
+                        commandRow(label: "curl", command: command)
+                        Text("The copied command includes your local access token. Keep it private.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text("Save settings to generate an authenticated test command.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
                 }
             }
         }
@@ -271,7 +276,7 @@ struct SettingsView: View {
             }
 
             Button {
-                let path = ConfigManager.defaultConfigPath
+                let path = viewModel.activeConfigPath
                 NSWorkspace.shared.open(URL(fileURLWithPath: path))
             } label: {
                 Image(systemName: "doc.text")

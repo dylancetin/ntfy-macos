@@ -124,8 +124,8 @@ class StatusBarController: NSObject {
     }
 
     @objc func showConfigInFinder() {
-        let configPath = NSString(string: "~/.config/ntfy-macos").expandingTildeInPath
-        NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: configPath)
+        let configURL = URL(fileURLWithPath: ConfigManager.shared.activeConfigPath)
+        NSWorkspace.shared.activateFileViewerSelecting([configURL])
     }
 
     @objc func reloadConfig() {
