@@ -148,7 +148,7 @@ enum SecureConfigFile {
 enum PrivateFileAccess {
     static func rejectAllowACLs(on fd: Int32, directory: Bool = false) throws {
         guard let acl = acl_get_fd(fd) else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
-        defer { acl_free(acl) }
+        defer { acl_free(UnsafeMutableRawPointer(acl)) }
         guard acl_valid(acl) == 0 else { throw ConfigError.insecureFilePermissions("Cannot validate file ACL") }
         var entry: acl_entry_t?
         var selector = Int32(ACL_FIRST_ENTRY.rawValue)
@@ -177,7 +177,7 @@ enum PrivateFileAccess {
 
     static func removeACL(on fd: Int32) throws {
         guard let acl = acl_init(0) else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
-        defer { acl_free(acl) }
+        defer { acl_free(UnsafeMutableRawPointer(acl)) }
         guard acl_set_fd(fd, acl) == 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
     }
 }

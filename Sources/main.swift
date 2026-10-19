@@ -44,10 +44,11 @@ enum AppConstants {
         do {
             try ConfigManager.shared.loadConfig(from: configPath)
         } catch ConfigError.fileNotFound {
+            let samplePath = configPath ?? ConfigManager.defaultConfigPath
             print("Configuration file not found.")
-            print("Creating sample configuration at \(ConfigManager.defaultConfigPath)")
+            print("Creating sample configuration at \(samplePath)")
             do {
-                try ConfigManager.createSampleConfig()
+                try ConfigManager.createSampleConfig(at: samplePath)
                 print("Sample configuration created. Please edit it and restart the service.")
                 exit(1)
             } catch {
